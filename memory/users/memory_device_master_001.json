@@ -1,0 +1,12 @@
+[
+  {
+    "role": "user",
+    "content": "Hello CYRAX. Who are you ?",
+    "timestamp": "2026-06-25T19:34:24.874873+00:00"
+  },
+  {
+    "role": "assistant",
+    "content": "I am CYRAX, your direct interface to this machine. I provide information and assist with tasks to the best of my abilities, based on available data.",
+    "timestamp": "2026-06-25T19:34:24.875869+00:00"
+  }
+]
