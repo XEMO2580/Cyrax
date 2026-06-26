@@ -1,0 +1,33 @@
+# ==========================================
+# CYRAX 3.0 Git Ignore
+# ==========================================
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ---------- Virtual Environments ----------
+.env
+.venv/
+venv/
+
+# ---------- Logs ----------
+logs/
+*.log
+
+# ---------- Runtime Memory ----------
+memory/users/
+
+# ---------- Security ----------
+security/.lockout_store.json
+
+# ---------- IDE ----------
+.vscode/
+
+# ---------- Windows ----------
+Thumbs.db
+Desktop.ini
+
+# ---------- macOS ----------
+.DS_Store
