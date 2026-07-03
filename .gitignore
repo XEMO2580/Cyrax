@@ -6,6 +6,7 @@
 __pycache__/
 *.py[cod]
 *.pyo
+.pytest_cache/
 
 # ---------- Virtual Environments ----------
 .env
@@ -18,6 +19,7 @@ logs/
 
 # ---------- Runtime Memory ----------
 memory/users/
+security/.lockout_store.json
 
 # ---------- Security ----------
 security/.lockout_store.json
@@ -25,9 +27,20 @@ security/.lockout_store.json
 # ---------- IDE ----------
 .vscode/
 
+# OS
+.DS_Store
+Thumbs.db
+
 # ---------- Windows ----------
 Thumbs.db
 Desktop.ini
 
 # ---------- macOS ----------
 .DS_Store
+requirements-dev.txt
+tools/__pycache__/registry.cpython-311.pyc
+tools/__pycache__/registry.cpython-311.pyc
+orchestrator/intent_parser/__pycache__/fast_path.cpython-311.pyc
+orchestrator/__pycache__/dispatcher.cpython-311.pyc
+config/__pycache__/settings.cpython-311.pyc
+app/__pycache__/bootstrap.cpython-311.pyc

@@ -212,6 +212,7 @@ class ToolRegistry:
         self,
         tool_name: str,
         args: dict[str, Any],
+        ctx: Any = None,
     ) -> dict[str, Any]:
         """
         Single execution entry point. All tool calls flow through here.
@@ -262,7 +263,14 @@ class ToolRegistry:
                 "response": f"Unknown tool: '{tool_name}'. It may not be registered.",
             }
 
-        # ── 3. Security Authorization ─────────────────────────────────────────
+        # ── 3. Context injection (required for context-aware tools) ─────────
+        # Inject ctx and the real running loop BEFORE any security gate check
+        # so tools like ScheduleTaskTool can inspect target tool metadata.
+        if ctx is not None:
+            tool._ctx = ctx
+            tool._loop = asyncio.get_running_loop()
+
+        # ── 4. Security Authorization ─────────────────────────────────────────
         if not self._security.authorize_action(tool.security_level):
             logger.warning(
                 f"[REGISTRY] Auth required: {tool_name} "

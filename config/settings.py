@@ -73,6 +73,24 @@ class CyraxSettings(BaseSettings):
         description="Gmail app password for email_ops.py.",
     )
 
+    SMTP_SERVER: str = Field(
+        default="",
+        description="SMTP server hostname used by email_ops.py.",
+    )
+
+    SMTP_PORT: int = Field(
+        default=587,
+        ge=1,
+        le=65535,
+        description="SMTP server port used by email_ops.py.",
+    )
+
+    IMAP_SERVER: str = Field(
+        default="",
+        description="IMAP server hostname used by email_ops.py.",
+    )
+
+
     # ── Brain Routing ─────────────────────────────────────────────────────────
 
     ACTIVE_LLM: ActiveLLM = Field(
@@ -319,7 +337,10 @@ class CyraxSettings(BaseSettings):
         "env_file_encoding": "utf-8",
         "case_sensitive":    True,
         "extra":             "ignore",
-        "frozen":            True,      # Prevents runtime mutation of any config field.
+        # Allow tests to monkeypatch credentials (unit tests rely on this).
+        # Runtime code should still treat settings as effectively read-only.
+        "frozen":            False,
+
     }
 
 

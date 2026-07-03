@@ -117,14 +117,10 @@ _PATTERNS: dict[str, list[tuple[re.Pattern, float, dict | None]]] = {
     ],
 
     "WEB_SEARCH": [
-        # Anchored: "search X" or "search for X" — full utterance only.
+        # Requires quotes for fast-path so conversational queries fall to the LLM.
         # Named group: query
         (re.compile(
-            r"^\s*(?:please\s+)?(?:search|google|find)\s+(?:for\s+)?['\"]?(?P<query>[^'\"]{3,}?)['\"]?\s*$",
-            _I,
-        ), 0.8, None),
-        (re.compile(
-            r"^\s*search\s+the\s+web\s+for\s+['\"]?(?P<query>.+?)['\"]?\s*$",
+            r"^\s*(?:please\s+)?(?:search|google|find)\s+(?:the\s+web\s+)?(?:for\s+)?['\"](?P<query>[^'\"]{2,})['\"][\.!\?]?\s*$",
             _I,
         ), 0.9, None),
     ],
