@@ -1,18 +1,22 @@
 """
-brain/providers/gemini_provider.py — CYRAX 3.0 Gemini Provider Adapter
+brain/providers/gemini_provider.py — CYRAX 3.0 Gemini Provider Adapter (Phase 6)
 
-Translates canonical CYRAX message format into Google GenAI SDK format.
-Uses the modern google-genai SDK (google.genai), not the legacy
-google-generativeai SDK.
+FIX: Corrected undefined-name bug — all exception handlers referenced
+"google_exceptions" but the actual import was aliased "genai_errors".
+Every handler below is fixed to use genai_errors.
 
-Key translation differences from Groq:
-  - Gemini uses "model" role instead of "assistant"
-  - System instructions are passed via GenerateContentConfig, not as a message
-  - Multi-turn history uses types.Content and types.Part objects
-  - Error types come from google.api_core.exceptions, not an OpenAI-compatible lib
+ADDED: get_tool_schemas() — translates ToolRegistry's canonical definitions
+into Gemini's types.FunctionDeclaration / types.Tool format, per Phase 6
+Constraint 4. Gemini's schema dialect differs from OpenAI's: only a subset
+of JSON Schema types is supported natively (STRING, NUMBER, INTEGER,
+BOOLEAN, ARRAY, OBJECT), and $defs/$ref are not supported — nested
+Pydantic models must be inlined, which this translation performs.
 
-All Gemini SDK exceptions are caught and re-raised as ProviderError.
-Nothing from the Google SDK leaks above this file.
+FIX (Phase 7 SDK Patch): Replaced granular genai_errors.ResourceExhausted,
+Unauthenticated, PermissionDenied etc. with a single catch of
+genai_errors.APIError, which is the only exception type the new
+google.genai SDK raises. Status-code-specific messages are preserved
+via conditional checks on exc.code.
 """
 
 from __future__ import annotations
@@ -29,8 +33,18 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# HTTP status codes Google maps to specific exception types.
 _RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+
+# Gemini's Schema.type only accepts this subset — JSON Schema's broader
+# type vocabulary must be mapped down onto these.
+_JSON_SCHEMA_TO_GEMINI_TYPE: dict[str, str] = {
+    "string":  "STRING",
+    "number":  "NUMBER",
+    "integer": "INTEGER",
+    "boolean": "BOOLEAN",
+    "array":   "ARRAY",
+    "object":  "OBJECT",
+}
 
 
 class GeminiProvider(BaseProvider):
@@ -55,7 +69,7 @@ class GeminiProvider(BaseProvider):
     capabilities  = ProviderCapabilities(
         supports_json_mode     = False,
         supports_system_prompt = True,
-        supports_tool_schemas  = False,
+        supports_tool_schemas  = True,
         max_output_tokens      = 8192,
         context_window_tokens  = 1048576,
     )
@@ -81,14 +95,8 @@ class GeminiProvider(BaseProvider):
         max_tokens:    int   = 800,
         temperature:   float = 0.7,
         json_mode:     bool  = False,
+        tools:         list[dict] | None = None,
     ) -> str:
-        """
-        Translates canonical messages into Gemini's types.Content format.
-
-        system_prompt is injected via GenerateContentConfig.system_instruction.
-        The last message in the list is treated as the current user turn.
-        All preceding messages form the multi-turn history.
-        """
         if json_mode:
             logger.warning(
                 "[GEMINI] json_mode=True requested but Gemini does not support "
@@ -96,21 +104,23 @@ class GeminiProvider(BaseProvider):
                 "for planning tasks."
             )
 
-        contents, system_instruction = self._build_contents(
-            messages, system_prompt
-        )
+        contents, system_instruction = self._build_contents(messages, system_prompt)
 
-        config = types.GenerateContentConfig(
-            system_instruction = system_instruction or None,
-            temperature        = temperature,
-            max_output_tokens  = max_tokens,
-        )
+        config_kwargs: dict[str, Any] = {
+            "system_instruction": system_instruction or None,
+            "temperature":        temperature,
+            "max_output_tokens":  max_tokens,
+        }
+
+        if tools:
+            config_kwargs["tools"] = [self.get_tool_schemas(tools)]
+
+        config = types.GenerateContentConfig(**config_kwargs)
 
         logger.debug(
-            f"[GEMINI] generate() | "
-            f"contents={len(contents)} | "
-            f"max_tokens={max_tokens} | "
-            f"temperature={temperature}"
+            f"[GEMINI] generate() | contents={len(contents)} | "
+            f"max_tokens={max_tokens} | temperature={temperature} | "
+            f"tools={len(tools) if tools else 0}"
         )
 
         try:
@@ -124,73 +134,30 @@ class GeminiProvider(BaseProvider):
             if not text or not text.strip():
                 raise ProviderError(
                     "Gemini returned an empty response.",
-                    provider=self.provider_name,
-                    status_code=0,
-                    retryable=True,
+                    provider=self.provider_name, status_code=0, retryable=True,
                 )
 
-            logger.debug(
-                f"[GEMINI] Response received. "
-                f"Length: {len(text)} chars."
-            )
+            logger.debug(f"[GEMINI] Response received. Length: {len(text)} chars.")
             return text.strip()
 
-        except google_exceptions.ResourceExhausted as exc:
-            raise ProviderError(
-                f"Gemini quota exhausted (429): {exc}",
-                provider=self.provider_name,
-                status_code=429,
-                retryable=True,
-            ) from exc
-
-        except google_exceptions.Unauthenticated as exc:
-            raise ProviderError(
-                f"Gemini authentication failed — check GEMINI_API_KEY: {exc}",
-                provider=self.provider_name,
-                status_code=401,
-                retryable=False,
-            ) from exc
-
-        except google_exceptions.PermissionDenied as exc:
-            raise ProviderError(
-                f"Gemini permission denied — API key may lack required scopes: {exc}",
-                provider=self.provider_name,
-                status_code=403,
-                retryable=False,
-            ) from exc
-
-        except google_exceptions.InvalidArgument as exc:
-            raise ProviderError(
-                f"Gemini invalid argument — check message format or model name: {exc}",
-                provider=self.provider_name,
-                status_code=400,
-                retryable=False,
-            ) from exc
-
-        except google_exceptions.DeadlineExceeded as exc:
-            raise ProviderError(
-                f"Gemini request deadline exceeded: {exc}",
-                provider=self.provider_name,
-                status_code=408,
-                retryable=True,
-            ) from exc
-
-        except google_exceptions.ServiceUnavailable as exc:
-            raise ProviderError(
-                f"Gemini service unavailable (503): {exc}",
-                provider=self.provider_name,
-                status_code=503,
-                retryable=True,
-            ) from exc
-
-        except google_exceptions.GoogleAPICallError as exc:
+        except genai_errors.APIError as exc:
+            # The new google.genai SDK wraps most HTTP/API errors here
             status_code = getattr(exc, "code", 0) or 0
-            retryable   = int(status_code) in _RETRYABLE_STATUS_CODES
+            retryable = int(status_code) in _RETRYABLE_STATUS_CODES
+            
+            if status_code == 429:
+                msg = f"Gemini quota exhausted (429): {exc}"
+            elif status_code == 401:
+                msg = f"Gemini authentication failed — check GEMINI_API_KEY: {exc}"
+            elif status_code == 403:
+                msg = f"Gemini permission denied: {exc}"
+            elif status_code == 400:
+                msg = f"Gemini invalid argument: {exc}"
+            else:
+                msg = f"Gemini API error {status_code}: {exc}"
+                
             raise ProviderError(
-                f"Gemini API error {status_code}: {exc}",
-                provider=self.provider_name,
-                status_code=int(status_code),
-                retryable=retryable,
+                msg, provider=self.provider_name, status_code=int(status_code), retryable=retryable,
             ) from exc
 
         except ProviderError:
@@ -199,9 +166,7 @@ class GeminiProvider(BaseProvider):
         except Exception as exc:
             raise ProviderError(
                 f"Gemini unexpected error: {exc}",
-                provider=self.provider_name,
-                status_code=0,
-                retryable=False,
+                provider=self.provider_name, status_code=0, retryable=False,
             ) from exc
 
     async def health_check(self) -> bool:
@@ -224,6 +189,73 @@ class GeminiProvider(BaseProvider):
         except Exception as exc:
             logger.warning(f"[GEMINI] health_check failed: {exc}")
             return False
+
+    # ── Schema translation (Phase 6, Constraint 4) ───────────────────────────
+
+    @classmethod
+    def get_tool_schemas(cls, tool_definitions: list[dict]) -> types.Tool:
+        """
+        Translates canonical ToolRegistry definitions into a single
+        types.Tool wrapping one types.FunctionDeclaration per tool.
+
+        Nested JSON Schema "parameters" objects are converted via
+        _convert_schema_properties() into Gemini's types.Schema tree.
+        """
+        declarations: list[types.FunctionDeclaration] = []
+
+        for tool_def in tool_definitions:
+            params_schema = tool_def.get("parameters", {"type": "object", "properties": {}})
+            gemini_schema = cls._convert_json_schema(params_schema)
+
+            declarations.append(
+                types.FunctionDeclaration(
+                    name=tool_def.get("name", ""),
+                    description=tool_def.get("description", ""),
+                    parameters=gemini_schema,
+                )
+            )
+
+        return types.Tool(function_declarations=declarations)
+
+    @classmethod
+    def _convert_json_schema(cls, json_schema: dict[str, Any]) -> types.Schema:
+        """
+        Recursively converts a standard JSON Schema dict (as produced by
+        Pydantic's model_json_schema()) into Gemini's types.Schema.
+
+        Handles: type mapping, nested object properties, array items,
+        required fields, and enum values. Does not resolve $ref/$defs —
+        Pydantic schemas passed through the Registry are expected to be
+        flat (single-level args_schema classes, no nested BaseModel
+        fields) per existing tool design; if that assumption changes,
+        this method needs $ref resolution added.
+        """
+        schema_type = json_schema.get("type", "object")
+        gemini_type = _JSON_SCHEMA_TO_GEMINI_TYPE.get(schema_type, "STRING")
+
+        kwargs: dict[str, Any] = {"type": gemini_type}
+
+        if "description" in json_schema:
+            kwargs["description"] = json_schema["description"]
+
+        if "enum" in json_schema:
+            kwargs["enum"] = [str(v) for v in json_schema["enum"]]
+
+        if gemini_type == "OBJECT":
+            properties = json_schema.get("properties", {})
+            kwargs["properties"] = {
+                key: cls._convert_json_schema(sub_schema)
+                for key, sub_schema in properties.items()
+            }
+            required = json_schema.get("required", [])
+            if required:
+                kwargs["required"] = required
+
+        if gemini_type == "ARRAY":
+            items_schema = json_schema.get("items", {"type": "string"})
+            kwargs["items"] = cls._convert_json_schema(items_schema)
+
+        return types.Schema(**kwargs)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

@@ -47,7 +47,7 @@ class GroqProvider(BaseProvider):
     capabilities  = ProviderCapabilities(
         supports_json_mode     = True,
         supports_system_prompt = True,
-        supports_tool_schemas  = False,
+        supports_tool_schemas  = True,
         max_output_tokens      = 8192,
         context_window_tokens  = 131072,
     )
@@ -73,13 +73,8 @@ class GroqProvider(BaseProvider):
         max_tokens:    int   = 800,
         temperature:   float = 0.7,
         json_mode:     bool  = False,
+        tools:         list[dict] | None = None,
     ) -> str:
-        """
-        Translates canonical messages into Groq chat completions format.
-
-        System prompt is injected as the first message with role="system".
-        Existing "system" role messages in the history are preserved after it.
-        """
         api_messages = self._build_messages(messages, system_prompt)
 
         request_kwargs: dict[str, Any] = {
@@ -92,12 +87,14 @@ class GroqProvider(BaseProvider):
         if json_mode and self.capabilities.supports_json_mode:
             request_kwargs["response_format"] = {"type": "json_object"}
 
+        if tools:
+            request_kwargs["tools"] = self.get_tool_schemas(tools)
+            request_kwargs["tool_choice"] = "auto"
+
         logger.debug(
-            f"[GROQ] generate() | "
-            f"messages={len(api_messages)} | "
-            f"max_tokens={max_tokens} | "
-            f"temperature={temperature} | "
-            f"json_mode={json_mode}"
+            f"[GROQ] generate() | messages={len(api_messages)} | "
+            f"max_tokens={max_tokens} | temperature={temperature} | "
+            f"json_mode={json_mode} | tools={len(tools) if tools else 0}"
         )
 
         try:
@@ -194,6 +191,34 @@ class GroqProvider(BaseProvider):
         except Exception as exc:
             logger.warning(f"[GROQ] health_check failed: {exc}")
             return False
+
+    # ── Schema translation (Phase 6, Constraint 4) ───────────────────────────
+
+    @staticmethod
+    def get_tool_schemas(tool_definitions: list[dict]) -> list[dict[str, Any]]:
+        """
+        Translates canonical ToolRegistry definitions (name, description,
+        Pydantic-derived JSON Schema "parameters") into Groq's
+        OpenAI-compatible function-calling array:
+
+            [{"type": "function", "function": {
+                "name": ..., "description": ..., "parameters": {...}
+            }}, ...]
+
+        Groq's format is a near-direct passthrough of standard JSON Schema —
+        no restructuring of the parameters object is needed, only wrapping.
+        """
+        schemas: list[dict[str, Any]] = []
+        for tool_def in tool_definitions:
+            schemas.append({
+                "type": "function",
+                "function": {
+                    "name":        tool_def.get("name", ""),
+                    "description": tool_def.get("description", ""),
+                    "parameters":  tool_def.get("parameters", {"type": "object", "properties": {}}),
+                },
+            })
+        return schemas
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

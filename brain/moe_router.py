@@ -4,7 +4,7 @@ brain/moe_router.py — CYRAX 3.0 Mixture-of-Experts Brain Router
 Implements BrainRouterProtocol (core/context.py):
     async def route(messages, trace_id) -> str
     async def plan(user_input, history, tool_definitions, trace_id) -> list[dict]
-    async def chat(user_input, history, trace_id) -> str
+    async def chat(user_input, history, trace_id, provider_name=None) -> str
 
 Routing strategy (settings.ACTIVE_LLM):
     "auto"   — classifier selects groq or gemini based on task complexity.
@@ -21,6 +21,8 @@ plan() contract:
 chat() contract:
     - Handles all inputs that plan() returns [] for.
     - Uses persona-injected system prompt.
+    - Supports provider_name override (Phase 7 — Decision Engine routing).
+    - Built-in failover telemetry with [FAILOVER] log tags.
     - Returns sanitised non-empty string.
 """
 
@@ -28,8 +30,11 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
+from brain.provider_events import ProviderExecutionEvent
+from brain.provider_metrics import ProviderMetricsManager
 from brain.providers.base import BaseProvider, ProviderError
 from config.settings import settings, ActiveLLM
 
@@ -258,19 +263,24 @@ class MoERouter:
     Satisfies BrainRouterProtocol (core/context.py):
         async def route(messages, trace_id) -> str
         async def plan(user_input, history, tool_definitions, trace_id) -> list[dict]
-        async def chat(user_input, history, trace_id) -> str
+        async def chat(user_input, history, trace_id, provider_name=None) -> str
 
     Injected with pre-initialised provider instances by bootstrap().
     Never imports or instantiates providers directly.
     """
 
-    def __init__(self, providers: dict[str, BaseProvider]) -> None:
+    def __init__(
+        self,
+        providers:       dict[str, BaseProvider],
+        metrics_manager: ProviderMetricsManager,
+    ) -> None:
         if not providers:
             raise ValueError(
                 "MoERouter requires at least one provider. "
                 "Received empty providers dict."
             )
         self._providers = providers
+        self._metrics   = metrics_manager
         logger.info(
             f"[MOE_ROUTER] Initialised. "
             f"Providers: {list(providers.keys())} | "
@@ -356,36 +366,135 @@ class MoERouter:
 
     async def chat(
         self,
-        user_input: str,
-        history:    list[dict],
-        trace_id:   str,
+        user_input:    str,
+        history:       list[dict],
+        trace_id:      str,
+        provider_name: str | None = None,
+        intent:        str = "unknown",
     ) -> str:
         """
-        Generates a conversational response for inputs plan() returns [] for.
-        Greetings, identity questions, and general inquiries are handled here.
+        Generates a conversational response, attempting provider_name first
+        (if supplied) and failing over through the remaining providers on
+        a retryable ProviderError.
+
+        Failover telemetry: every switch is logged at WARNING with the
+        [FAILOVER] tag, the failed provider, its status code, and the
+        provider being switched to — all in one grep-able line.
+
+        Non-retryable errors (retryable=False) do NOT trigger failover —
+        they are treated as a hard stop and re-raised as a synthesized
+        error string, since silently falling back on e.g. an auth failure
+        could mask real misconfiguration behind an apparently-working
+        response from a different provider.
+
+        Phase 7.2: each generate() call is timed and recorded as a
+        ProviderExecutionEvent via ProviderMetricsManager.
         """
-        provider = await self._select_provider(task_hint="chat", trace_id=trace_id)
-        system_prompt = _build_chat_system_prompt(provider.provider_name)
+        candidates = self._build_failover_candidates(provider_name)
 
-        safe_history = history[-10:]
-        messages     = safe_history + [{"role": "user", "content": user_input}]
+        system_prompt = _build_chat_system_prompt(provider_name or "groq")
+        messages = history + [{"role": "user", "content": user_input}]
 
-        logger.info(
-            f"[{trace_id}] CHAT | "
-            f"provider={provider.provider_name} | "
-            f"history_len={len(safe_history)}"
+        last_error: ProviderError | None = None
+
+        for index, candidate_name in enumerate(candidates):
+            provider = self._providers.get(candidate_name)
+            if provider is None:
+                logger.warning(
+                    f"[{trace_id}] MOE_ROUTER | "
+                    f"Candidate provider '{candidate_name}' not registered. Skipping."
+                )
+                continue
+
+            start = time.monotonic()
+
+            try:
+                response = await provider.generate(
+                    messages=messages,
+                    system_prompt=system_prompt,
+                    max_tokens=800,
+                    temperature=0.7,
+                )
+                latency_ms = (time.monotonic() - start) * 1000
+
+                self._metrics.record_event(ProviderExecutionEvent(
+                    provider=candidate_name,
+                    intent=intent,
+                    latency_ms=latency_ms,
+                    success=True,
+                    status_code=200,
+                ))
+
+                if index > 0:
+                    logger.info(
+                        f"[{trace_id}] MOE_ROUTER | "
+                        f"Failover recovery succeeded via '{candidate_name}' "
+                        f"after {index} prior failure(s)."
+                    )
+                return _sanitize_output(response)
+
+            except ProviderError as exc:
+                latency_ms = (time.monotonic() - start) * 1000
+                last_error = exc
+
+                self._metrics.record_event(ProviderExecutionEvent(
+                    provider=candidate_name,
+                    intent=intent,
+                    latency_ms=latency_ms,
+                    success=False,
+                    status_code=exc.status_code,
+                ))
+
+                if not exc.retryable:
+                    logger.error(
+                        f"[{trace_id}] MOE_ROUTER | "
+                        f"Non-retryable error from '{candidate_name}' "
+                        f"(status={exc.status_code}): {exc}. Hard stop — no failover."
+                    )
+                    return (
+                        f"I couldn't complete that request due to a configuration "
+                        f"issue with the '{candidate_name}' provider ({exc})."
+                    )
+
+                next_candidate = candidates[index + 1] if index + 1 < len(candidates) else None
+
+                if next_candidate:
+                    logger.warning(
+                        f"[FAILOVER] [{trace_id}] "
+                        f"Provider '{candidate_name}' failed "
+                        f"(status={exc.status_code}, retryable=True): {exc}. "
+                        f"Switching to '{next_candidate}'."
+                    )
+                else:
+                    logger.error(
+                        f"[FAILOVER] [{trace_id}] "
+                        f"Provider '{candidate_name}' failed "
+                        f"(status={exc.status_code}, retryable=True): {exc}. "
+                        f"No further providers available — failover chain exhausted."
+                    )
+
+        logger.error(
+            f"[{trace_id}] MOE_ROUTER | "
+            f"All providers exhausted. Last error: {last_error!r}"
+        )
+        return (
+            "I'm having trouble reaching any AI provider right now. "
+            "Please try again shortly."
         )
 
-        response = await self._generate_with_failover(
-            provider=provider,
-            messages=messages,
-            system_prompt=system_prompt,
-            trace_id=trace_id,
-            max_tokens=800,
-            temperature=0.7,
-        )
+    def _build_failover_candidates(self, provider_name: str | None) -> list[str]:
+        """
+        Builds the ordered candidate list: the requested provider first
+        (if supplied and registered), followed by the remaining registered
+        providers in a stable default order.
+        """
+        default_order = ["groq", "gemini", "ollama"]
 
-        return _sanitize_output(response)
+        if provider_name and provider_name in self._providers:
+            rest = [p for p in default_order if p != provider_name and p in self._providers]
+            return [provider_name] + rest
+
+        return [p for p in default_order if p in self._providers]
 
     # ── Provider Selection ────────────────────────────────────────────────────
 

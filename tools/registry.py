@@ -31,6 +31,10 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
+# ── Module-level addition ─────────────────────────────────────────────────
+_EMERGENCY_OUTPUT_CEILING: int = 100_000
+_TRUNCATION_NOTICE: str = "...[SYSTEM EMERGENCY TRUNCATION]"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECURITY LEVEL
@@ -312,6 +316,16 @@ class ToolRegistry:
             )
 
             result_str = str(raw_result).strip()
+
+            # ── Emergency output ceiling enforcement ──────────────────────
+            if len(result_str) > _EMERGENCY_OUTPUT_CEILING:
+                logger.warning(
+                    f"[REGISTRY] Emergency ceiling breached: {tool_name} "
+                    f"returned {len(result_str):,} chars "
+                    f"(limit {_EMERGENCY_OUTPUT_CEILING:,}). Truncating."
+                )
+                cutoff = _EMERGENCY_OUTPUT_CEILING - len(_TRUNCATION_NOTICE)
+                result_str = result_str[:cutoff] + _TRUNCATION_NOTICE
 
             # Structured status detection via field prefix convention.
             # Tools return "Error: ..." on failure, anything else on success.

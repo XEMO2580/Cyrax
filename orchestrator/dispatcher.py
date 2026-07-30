@@ -1,467 +1,11 @@
-# """
-# orchestrator/dispatcher.py — CYRAX 3.0 Orchestration Layer (DI Compliant)
-
-# Architectural contracts enforced:
-#   - Zero dynamic imports. All domain logic accessed via CyraxContext.
-#   - No tool names hardcoded. Fallback rules live in fallback_policy.py.
-#   - Pronoun resolution uses regex boundary detection for voice robustness.
-#   - Security accessed via ctx.security — never imports security.auth directly.
-#   - Brain accessed via ctx.brain_router.plan() / .chat() — never imports brain/.
-
-# Entry point: Dispatcher.handle()
-# Called by:   router_brain in app/cli_main.py and app/api_server.py
-# """
-
-# from __future__ import annotations
-
-# import asyncio
-# import logging
-# import re
-# import uuid
-# from typing import Any
-
-# from config.settings import settings
-# from core.context import CyraxContext
-# from orchestrator.supervisor import AgentSupervisor
-
-# logger = logging.getLogger(__name__)
-
-
-# # ══════════════════════════════════════════════════════════════════════════════
-# # CONSTANTS
-# # ══════════════════════════════════════════════════════════════════════════════
-
-# _SHUTDOWN_PHRASES: frozenset[str] = frozenset({
-#     "shutdown", "exit", "quit", "shutdown cyrax",
-# })
-
-# # Regex patterns for pronoun resolution.
-# # Matches verb + pronoun anywhere in the utterance, including with polite
-# # prefixes ("please close it", "can you open that up", "close that now").
-# _PRONOUN_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-#     (re.compile(r"\b(close|quit|kill|shut)\b.+\b(it|that|this|the app|the application)\b", re.IGNORECASE), "close"),
-#     (re.compile(r"\b(open|launch|start)\b.+\b(it|that|this|the app|the application)\b", re.IGNORECASE), "open"),
-# ]
-
-
-# # ══════════════════════════════════════════════════════════════════════════════
-# # DISPATCHER
-# # ══════════════════════════════════════════════════════════════════════════════
-
-# class Dispatcher:
-#     """
-#     Stateless orchestrator. All state is accessed through CyraxContext.
-#     No module-level or instance-level state.
-
-#     Satisfies DispatcherProtocol from core/context.py:
-#         async def handle(self, user_input, session_id, trace_id, ctx) -> dict
-#     """
-
-#     # ── Entry Point ───────────────────────────────────────────────────────────
-
-#     async def handle(
-#         self,
-#         user_input: str,
-#         session_id: str,
-#         trace_id: str,
-#         ctx: CyraxContext,
-#     ) -> dict[str, Any]:
-#         """
-#         Primary dispatch entry point.
-
-#         Returns:
-#             {
-#                 "status":   "success" | "error" | "auth_required" | "shutdown",
-#                 "response": str,
-#             }
-#         """
-#         req_id = f"{trace_id}:{uuid.uuid4().hex[:4]}"
-#         logger.info(f"[{req_id}] DISPATCH_START | input='{user_input[:80]}'")
-
-#         user_input = user_input.strip()
-#         if not user_input:
-#             return {"status": "error", "response": "No input received."}
-
-#         # ── Shutdown ──────────────────────────────────────────────────────────
-#         if user_input.lower() in _SHUTDOWN_PHRASES:
-#             return {"status": "shutdown", "response": "Shutting down."}
-
-#         # ── Pending auth interception ─────────────────────────────────────────
-#         if ctx.memory.state.get("pending_auth"):
-#             return await self._resume_after_auth(user_input, req_id, ctx)
-
-#         # ── Pronoun resolution ────────────────────────────────────────────────
-#         resolved_input = self._resolve_pronouns(user_input, ctx)
-
-#         # ── Fast-path intent resolution ───────────────────────────────────────
-#         from orchestrator.intent_parser.fast_path import IntentRouter, ParsedIntent
-
-#         parsed: ParsedIntent | None = IntentRouter.parse(resolved_input)
-
-#         if parsed:
-#             logger.debug(
-#                 f"[{req_id}] FAST_PATH | "
-#                 f"tool={parsed.tool_name} confidence={parsed.confidence}"
-#             )
-#             return await self._execute_intent(
-#                 parsed.tool_name,
-#                 parsed.parameters,
-#                 resolved_input,
-#                 req_id,
-#                 ctx,
-#             )
-
-#         # ── LLM planning path ─────────────────────────────────────────────────
-#         logger.debug(f"[{req_id}] LLM_PATH")
-#         return await self._llm_pipeline(resolved_input, req_id, ctx)
-
-#     # ── Auth Flow ─────────────────────────────────────────────────────────────
-
-#     async def _resume_after_auth(
-#         self,
-#         raw_pin: str,
-#         req_id: str,
-#         ctx: CyraxContext,
-#     ) -> dict[str, Any]:
-#         """
-#         Treats user input as a PIN attempt.
-#         On success, replays the pending tool call.
-#         Accesses security exclusively via ctx.security.
-#         """
-#         authenticated = ctx.security.authenticate(raw_pin)
-
-#         if not authenticated:
-#             locked, remaining = ctx.security.is_locked_out()
-#             if locked:
-#                 ctx.memory.state.clear("pending_auth")
-#                 ctx.memory.state.clear("pending_tool")
-#                 ctx.memory.state.clear("pending_args")
-#                 return {
-#                     "status": "error",
-#                     "response": (
-#                         f"Too many failed attempts. "
-#                         f"System locked for {int(remaining)} seconds."
-#                     ),
-#                 }
-#             return {
-#                 "status": "auth_required",
-#                 "response": "Incorrect PIN. Please try again.",
-#             }
-
-#         pending_tool: str | None = ctx.memory.state.get("pending_tool")
-#         pending_args: dict | None = ctx.memory.state.get("pending_args")
-
-#         ctx.memory.state.clear("pending_auth")
-#         ctx.memory.state.clear("pending_tool")
-#         ctx.memory.state.clear("pending_args")
-
-#         if not pending_tool:
-#             return {"status": "success", "response": "Authenticated successfully."}
-
-#         logger.info(f"[{req_id}] AUTH_RESUME | replaying tool={pending_tool}")
-#         return await self._execute_intent(
-#             pending_tool,
-#             pending_args or {},
-#             f"[auth-resume] {pending_tool}",
-#             req_id,
-#             ctx,
-#         )
-
-#     # ── Pronoun Resolution ────────────────────────────────────────────────────
-
-#     def _resolve_pronouns(
-#         self,
-#         user_input: str,
-#         ctx: CyraxContext,
-#     ) -> str:
-#         """
-#         Replaces app-referencing pronouns with the last opened app name.
-
-#         Uses regex boundary detection — catches natural voice utterances:
-#             "close it"             → "close chrome"
-#             "please close it"      → "close chrome"
-#             "can you open that up" → "open chrome"
-#             "shut that down"       → "close chrome"
-#         """
-#         last_app: str | None = ctx.memory.state.get("last_opened_app")
-#         if not last_app:
-#             return user_input
-
-#         for pattern, verb in _PRONOUN_PATTERNS:
-#             if pattern.search(user_input):
-#                 resolved = f"{verb} {last_app}"
-#                 logger.debug(
-#                     f"PRONOUN_RESOLVE | '{user_input}' → '{resolved}'"
-#                 )
-#                 return resolved
-
-#         return user_input
-
-#     # ── Single-Intent Execution ───────────────────────────────────────────────
-
-#     async def _execute_intent(
-#         self,
-#         tool_name: str,
-#         args: dict[str, Any],
-#         user_text: str,
-#         req_id: str,
-#         ctx: CyraxContext,
-#     ) -> dict[str, Any]:
-#         """
-#         Executes a single resolved intent through the registry.
-#         Handles auth interception, last-opened-app tracking, and memory writes.
-#         """
-#         result = await self._execute_step(tool_name, args, req_id, ctx)
-
-#         if result["status"] == "auth_required":
-#             ctx.memory.state.set("pending_auth", True)
-#             ctx.memory.state.set("pending_tool", tool_name)
-#             ctx.memory.state.set("pending_args", args)
-#             await ctx.memory.conversation.add_interaction("user", user_text)
-#             await ctx.memory.conversation.add_interaction(
-#                 "assistant", result["response"]
-#             )
-#             return result
-
-#         if result["status"] == "success":
-#             app_name = args.get("app", "")
-#             if app_name:
-#                 ctx.memory.state.set("last_opened_app", app_name)
-
-        
-#         summary = result["response"]
-#         summary = self._sanitize_output(summary)
-
-#         await ctx.memory.conversation.add_interaction("user", user_text)
-#         await ctx.memory.conversation.add_interaction("assistant", summary)
-
-#         return {"status": result["status"], "response": summary}
-
-#     # ── LLM Planning Pipeline ─────────────────────────────────────────────────
-
-#     async def _llm_pipeline(
-#         self,
-#         user_text: str,
-#         req_id: str,
-#         ctx: CyraxContext,
-#     ) -> dict[str, Any]:
-#         """
-#         Full LLM path. Accessed exclusively via ctx.brain_router:
-#             ctx.brain_router.plan()  — tool call planning
-#             ctx.brain_router.chat()  — conversational generation
-
-#         Fallback rules accessed exclusively via ctx.fallback_policy:
-#             ctx.fallback_policy.get_fallback() — no tool names here
-#         """
-#         history = ctx.memory.conversation.get_history()
-#         tool_definitions = ctx.tool_registry.get_all_definitions()
-
-#         # ── Planning ──────────────────────────────────────────────────────────
-#         plan: list[dict] = await ctx.brain_router.plan(
-#             user_input=user_text,
-#             history=history,
-#             tool_definitions=tool_definitions,
-#             trace_id=req_id,
-#         )
-
-#         logger.debug(
-#             f"[{req_id}] PLAN | steps={len(plan)} "
-#             f"preview={[s.get('tool') for s in plan[:3]]}"
-#         )
-
-#         if not plan:
-#             # ── Conversational fallback (unchanged) ───────────────────────────
-#             logger.debug(f"[{req_id}] CHAT_FALLBACK")
-#             response = await ctx.brain_router.chat(
-#                 user_input=user_text,
-#                 history=history,
-#                 trace_id=req_id,
-#             )
-#             response = self._sanitize_output(response)
-#             await ctx.memory.conversation.add_interaction("user", user_text)
-#             await ctx.memory.conversation.add_interaction("assistant", response)
-#             return {"status": "success", "response": response}
-
-#         # ── Plan Execution ────────────────────────────────────────────────────
-#         if len(plan) > settings.MAX_AGENT_STEPS:
-#             logger.warning(
-#                 f"[{req_id}] PLAN_TRUNCATED | "
-#                 f"size={len(plan)} → {settings.MAX_AGENT_STEPS}"
-#             )
-#             plan = plan[: settings.MAX_AGENT_STEPS]
-
-#         results_log: list[str] = []
-#         successful_tools: list[str] = []
-
-#         for step in plan:
-#             tool_name: str = step.get("tool") or step.get("intent", "")
-#             args: dict = step.get("args", {})
-
-#             if not tool_name:
-#                 logger.warning(f"[{req_id}] PLAN_STEP_SKIP | missing tool name")
-#                 continue
-
-#             step_result = await self._execute_step(tool_name, args, req_id, ctx)
-
-#             # Auth interception mid-plan
-#             if step_result["status"] == "auth_required":
-#                 ctx.memory.state.set("pending_auth", True)
-#                 ctx.memory.state.set("pending_tool", tool_name)
-#                 ctx.memory.state.set("pending_args", args)
-#                 await ctx.memory.conversation.add_interaction("user", user_text)
-#                 await ctx.memory.conversation.add_interaction(
-#                     "assistant", step_result["response"]
-#                 )
-#                 return step_result
-
-#             results_log.append(step_result["response"])
-
-#             if step_result["status"] == "success":
-#                 successful_tools.append(tool_name)
-#                 app_name = args.get("app", "")
-#                 if app_name:
-#                     ctx.memory.state.set("last_opened_app", app_name)
-
-#             else:
-#                 logger.warning(
-#                     f"[{req_id}] STEP_FAILED | tool={tool_name} "
-#                     f"reason={step_result['response'][:80]}"
-#                 )
-
-#                 # ── Fallback policy query ─────────────────────────────────────
-#                 # Dispatcher does not know which tool falls back to which.
-#                 # That decision lives exclusively in fallback_policy.py.
-#                 fallback = ctx.fallback_policy.get_fallback(
-#                     failed_tool=tool_name,
-#                     error_status=step_result["status"],
-#                     original_args=args,
-#                 )
-
-#                 if fallback:
-#                     logger.info(
-#                         f"[{req_id}] FALLBACK | "
-#                         f"{tool_name} → {fallback['tool']}"
-#                     )
-#                     fb_result = await self._execute_step(
-#                         fallback["tool"],
-#                         fallback["args"],
-#                         req_id,
-#                         ctx,
-#                     )
-#                     results_log.append(fb_result["response"])
-#                     if fb_result["status"] == "success":
-#                         successful_tools.append(fallback["tool"])
-
-#                 # Supervisor hook point:
-#                 # When supervisor.py is wired in (Priority 2), it intercepts
-#                 # here before the break, analyses the failure, and may
-#                 # attempt additional recovery steps.
-#                 break
-
-#         # ── Plan Summary ──────────────────────────────────────────────────────
-#         summary = "\n\n".join(results_log) if results_log else "No actions completed."
-
-#         summary = self._sanitize_output(summary)
-
-#         await ctx.memory.conversation.add_interaction("user", user_text)
-#         await ctx.memory.conversation.add_interaction("assistant", summary)
-
-#         return {
-#             "status": "success" if successful_tools else "error",
-#             "response": summary,
-#         }
-
-#     # ── Tool Execution Step ───────────────────────────────────────────────────
-
-#     async def _execute_step(
-#         self,
-#         tool_name: str,
-#         args: dict[str, Any],
-#         req_id: str,
-#         ctx: CyraxContext,
-#     ) -> dict[str, Any]:
-#         """
-#         Executes a single tool through the registry with timeout protection.
-#         Never raises — always returns a structured result dict.
-#         Timeout sourced from settings, not hardcoded.
-#         """
-#         logger.info(f"[{req_id}] EXEC | tool={tool_name} args={args}")
-
-#         try:
-#             result: dict[str, Any] = await asyncio.wait_for(
-#                 ctx.tool_registry.execute_tool(tool_name, args),
-#                 timeout=settings.TOOL_TIMEOUT_SECONDS,
-#             )
-#             logger.debug(
-#                 f"[{req_id}] EXEC_DONE | "
-#                 f"tool={tool_name} status={result.get('status')}"
-#             )
-#             return result
-
-#         except asyncio.TimeoutError:
-#             logger.error(
-#                 f"[{req_id}] EXEC_TIMEOUT | "
-#                 f"tool={tool_name} after {settings.TOOL_TIMEOUT_SECONDS}s"
-#             )
-#             return {
-#                 "status": "error",
-#                 "response": (
-#                     f"Tool '{tool_name}' timed out after "
-#                     f"{settings.TOOL_TIMEOUT_SECONDS}s."
-#                 ),
-#             }
-
-#         except Exception as exc:
-#             logger.exception(
-#                 f"[{req_id}] EXEC_CRASH | tool={tool_name} error={exc}"
-#             )
-#             return {
-#                 "status": "error",
-#                 "response": f"Tool '{tool_name}' encountered an unexpected error.",
-#             }
-
-#     # ── Output Sanitizer ──────────────────────────────────────────────────────
-
-#     @staticmethod
-#     def _sanitize_output(text: str) -> str:
-#         if not text or not text.strip():
-#             return "I couldn't process that request."
-#         cleaned = "\n".join(
-#             line for line in text.splitlines() if line.strip()
-#         )
-#         if len(cleaned) > 1500:
-#             cleaned = cleaned[:1500] + "\n... [Response truncated]"
-#         return cleaned
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 """
-orchestrator/dispatcher.py — CYRAX 3.0 Orchestration Layer (DI Compliant)
+orchestrator/dispatcher.py — CYRAX 3.0 Orchestration Layer (Phase 8.3)
 
-Architectural contracts enforced:
-  - Zero dynamic imports. All domain logic accessed via CyraxContext.
-  - No tool names hardcoded. Fallback rules live in fallback_policy.py.
-  - Pronoun resolution uses regex boundary detection for voice robustness.
-  - Security accessed via ctx.security — never imports security.auth directly.
-  - Brain accessed via ctx.brain_router.plan() / .chat() — never imports brain/.
-  - Multi-step plan execution delegated to AgentSupervisor (Phase 3).
-    The Supervisor owns the execution loop, failure detection, reflection,
-    and bounded retries. The Dispatcher only owns routing decisions.
-
-Entry point: Dispatcher.handle()
-Called by:   router_brain in app/cli_main.py and app/api_server.py
+Phase 8.3 changes:
+  - _llm_pipeline() now routes based on execution_mode (background → queue,
+    immediate → chat, interactive → Planner).
+  - ctx.task_queue.submit() passes tools_required and provider_name directly
+    (no more hacky post-submit attribute patching).
 """
 
 from __future__ import annotations
@@ -474,49 +18,26 @@ from typing import Any
 
 from config.settings import settings
 from core.context import CyraxContext
-from orchestrator.supervisor import AgentSupervisor
+from orchestrator.planner import Planner
 
 logger = logging.getLogger(__name__)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CONSTANTS
-# ══════════════════════════════════════════════════════════════════════════════
 
 _SHUTDOWN_PHRASES: frozenset[str] = frozenset({
     "shutdown", "exit", "quit", "shutdown cyrax",
 })
 
-# Regex patterns for pronoun resolution.
-# Matches verb + pronoun anywhere in the utterance, including with polite
-# prefixes ("please close it", "can you open that up", "close that now").
 _PRONOUN_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(close|quit|kill|shut)\b.+\b(it|that|this|the app|the application)\b", re.IGNORECASE), "close"),
     (re.compile(r"\b(open|launch|start)\b.+\b(it|that|this|the app|the application)\b", re.IGNORECASE), "open"),
 ]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# DISPATCHER
-# ══════════════════════════════════════════════════════════════════════════════
-
 class Dispatcher:
     """
-    Stateless orchestrator. All state is accessed through CyraxContext.
-    No module-level or instance-level state.
-
-    Satisfies DispatcherProtocol from core/context.py:
-        async def handle(self, user_input, session_id, trace_id, ctx) -> dict
-
-    Execution path:
-        handle()
-          ├─ shutdown check
-          ├─ pending auth interception  → _resume_after_auth()
-          ├─ pronoun resolution         → _resolve_pronouns()
-          ├─ fast-path regex match      → _execute_intent()   (single tool)
-          └─ LLM planning path         → _llm_pipeline()
-               ├─ plan empty           → brain_router.chat()  (conversational)
-               └─ plan non-empty       → AgentSupervisor      (supervised execution)
+    Stateless orchestrator. Pure orchestration only.
+    Gates every non-fast-path query through the Decision Engine before
+    routing to either direct chat or the ReAct Planner.
     """
 
     # ── Entry Point ───────────────────────────────────────────────────────────
@@ -528,15 +49,6 @@ class Dispatcher:
         trace_id:   str,
         ctx:        CyraxContext,
     ) -> dict[str, Any]:
-        """
-        Primary dispatch entry point.
-
-        Returns:
-            {
-                "status":   "success" | "error" | "auth_required" | "shutdown",
-                "response": str,
-            }
-        """
         req_id = f"{trace_id}:{uuid.uuid4().hex[:4]}"
         logger.info(f"[{req_id}] DISPATCH_START | input='{user_input[:80]}'")
 
@@ -544,52 +56,29 @@ class Dispatcher:
         if not user_input:
             return {"status": "error", "response": "No input received."}
 
-        # ── Shutdown ──────────────────────────────────────────────────────────
         if user_input.lower() in _SHUTDOWN_PHRASES:
             return {"status": "shutdown", "response": "Shutting down."}
 
-        # ── Pending auth interception ─────────────────────────────────────────
         if ctx.memory.state.get("pending_auth"):
             return await self._resume_after_auth(user_input, req_id, ctx)
 
-        # ── Pronoun resolution ────────────────────────────────────────────────
         resolved_input = self._resolve_pronouns(user_input, ctx)
 
-        # ── Fast-path intent resolution ───────────────────────────────────────
         from orchestrator.intent_parser.fast_path import IntentRouter, ParsedIntent
-
         parsed: ParsedIntent | None = IntentRouter.parse(resolved_input)
 
         if parsed:
-            logger.debug(
-                f"[{req_id}] FAST_PATH | "
-                f"tool={parsed.tool_name} confidence={parsed.confidence}"
-            )
+            logger.debug(f"[{req_id}] FAST_PATH | tool={parsed.tool_name} confidence={parsed.confidence}")
             return await self._execute_intent(
-                parsed.tool_name,
-                parsed.parameters,
-                resolved_input,
-                req_id,
-                ctx,
+                parsed.tool_name, parsed.parameters, resolved_input, req_id, ctx,
             )
 
-        # ── LLM planning path ─────────────────────────────────────────────────
         logger.debug(f"[{req_id}] LLM_PATH")
         return await self._llm_pipeline(resolved_input, req_id, ctx)
 
-    # ── Auth Flow ─────────────────────────────────────────────────────────────
+    # ── Auth Flow (unchanged) ────────────────────────────────────────────────
 
-    async def _resume_after_auth(
-        self,
-        raw_pin: str,
-        req_id:  str,
-        ctx:     CyraxContext,
-    ) -> dict[str, Any]:
-        """
-        Treats user input as a PIN attempt.
-        On success, replays the pending tool call.
-        Accesses security exclusively via ctx.security.
-        """
+    async def _resume_after_auth(self, raw_pin: str, req_id: str, ctx: CyraxContext) -> dict[str, Any]:
         authenticated = ctx.security.authenticate(raw_pin)
 
         if not authenticated:
@@ -600,15 +89,9 @@ class Dispatcher:
                 ctx.memory.state.clear("pending_args")
                 return {
                     "status": "error",
-                    "response": (
-                        f"Too many failed attempts. "
-                        f"System locked for {int(remaining)} seconds."
-                    ),
+                    "response": f"Too many failed attempts. System locked for {int(remaining)} seconds.",
                 }
-            return {
-                "status":   "auth_required",
-                "response": "Incorrect PIN. Please try again.",
-            }
+            return {"status": "auth_required", "response": "Incorrect PIN. Please try again."}
 
         pending_tool: str | None  = ctx.memory.state.get("pending_tool")
         pending_args: dict | None = ctx.memory.state.get("pending_args")
@@ -622,61 +105,27 @@ class Dispatcher:
 
         logger.info(f"[{req_id}] AUTH_RESUME | replaying tool={pending_tool}")
         return await self._execute_intent(
-            pending_tool,
-            pending_args or {},
-            f"[auth-resume] {pending_tool}",
-            req_id,
-            ctx,
+            pending_tool, pending_args or {}, f"[auth-resume] {pending_tool}", req_id, ctx,
         )
 
-    # ── Pronoun Resolution ────────────────────────────────────────────────────
+    # ── Pronoun Resolution (unchanged) ───────────────────────────────────────
 
-    def _resolve_pronouns(
-        self,
-        user_input: str,
-        ctx:        CyraxContext,
-    ) -> str:
-        """
-        Replaces app-referencing pronouns with the last opened app name.
-
-        Uses regex boundary detection — catches natural voice utterances:
-            "close it"             → "close chrome"
-            "please close it"      → "close chrome"
-            "can you open that up" → "open chrome"
-            "shut that down"       → "close chrome"
-        """
+    def _resolve_pronouns(self, user_input: str, ctx: CyraxContext) -> str:
         last_app: str | None = ctx.memory.state.get("last_opened_app")
         if not last_app:
             return user_input
-
         for pattern, verb in _PRONOUN_PATTERNS:
             if pattern.search(user_input):
                 resolved = f"{verb} {last_app}"
-                logger.debug(
-                    f"PRONOUN_RESOLVE | '{user_input}' → '{resolved}'"
-                )
+                logger.debug(f"PRONOUN_RESOLVE | '{user_input}' → '{resolved}'")
                 return resolved
-
         return user_input
 
-    # ── Single-Intent Execution (fast-path only) ──────────────────────────────
+    # ── Single-Intent Execution (unchanged) ──────────────────────────────────
 
     async def _execute_intent(
-        self,
-        tool_name: str,
-        args:      dict[str, Any],
-        user_text: str,
-        req_id:    str,
-        ctx:       CyraxContext,
+        self, tool_name: str, args: dict[str, Any], user_text: str, req_id: str, ctx: CyraxContext,
     ) -> dict[str, Any]:
-        """
-        Executes a single resolved intent through the registry.
-        Used exclusively by the fast-path — single tool, no reflection loop.
-
-        Handles auth interception, last-opened-app tracking, and memory writes.
-        Multi-step plans and failure recovery are handled by AgentSupervisor,
-        not here.
-        """
         result = await self._execute_step(tool_name, args, req_id, ctx)
 
         if result["status"] == "auth_required":
@@ -684,9 +133,7 @@ class Dispatcher:
             ctx.memory.state.set("pending_tool", tool_name)
             ctx.memory.state.set("pending_args", args)
             await ctx.memory.conversation.add_interaction("user", user_text)
-            await ctx.memory.conversation.add_interaction(
-                "assistant", result["response"]
-            )
+            await ctx.memory.conversation.add_interaction("assistant", result["response"])
             return result
 
         if result["status"] == "success":
@@ -695,158 +142,112 @@ class Dispatcher:
                 ctx.memory.state.set("last_opened_app", app_name)
 
         summary = self._sanitize_output(result["response"])
-
         await ctx.memory.conversation.add_interaction("user", user_text)
         await ctx.memory.conversation.add_interaction("assistant", summary)
-
         return {"status": result["status"], "response": summary}
 
-    # ── LLM Planning Pipeline ─────────────────────────────────────────────────
+    # ── LLM Pipeline — Phase 8.3: Decision Engine + execution_mode routing ───
 
-    async def _llm_pipeline(
-        self,
-        user_text: str,
-        req_id:    str,
-        ctx:       CyraxContext,
-    ) -> dict[str, Any]:
+    async def _llm_pipeline(self, user_text: str, req_id: str, ctx: CyraxContext) -> dict[str, Any]:
         """
-        Full LLM path.
+        Decision Engine gates every non-fast-path query. Phase 8.3 adds
+        execution_mode routing on top of the existing tools_required gate:
 
-        1. Calls brain_router.plan() to generate a tool execution plan.
-        2. If plan is empty → conversational fallback via brain_router.chat().
-        3. If plan is non-empty → delegates to AgentSupervisor for supervised
-           execution with reflection-and-retry on failure.
-
-        The Dispatcher owns routing decisions.
-        AgentSupervisor owns plan execution, failure detection, and recovery.
+            immediate | interactive -> synchronous, exactly as before
+                (immediate  -> chat via selected_provider)
+                (interactive -> Planner forced onto selected_provider, if
+                                 tools_required; else chat)
+            background -> submitted to ctx.task_queue, NOT awaited.
+                Returns an acknowledgement immediately; TaskExecutor
+                processes it and NotificationCenter delivers the result
+                later — this method never blocks on background work.
         """
-        history          = ctx.memory.conversation.get_history()
-        tool_definitions = ctx.tool_registry.get_all_definitions()
+        history = ctx.memory.conversation.get_history()
 
-        # ── Planning ──────────────────────────────────────────────────────────
-        plan: list[dict] = await ctx.brain_router.plan(
-            user_input       = user_text,
-            history          = history,
-            tool_definitions = tool_definitions,
-            trace_id         = req_id,
+        decision = await ctx.decision_engine.classify(user_text)
+
+        logger.info(
+            f"[{req_id}] DECISION_ENGINE | "
+            f"intent={decision.intent} | "
+            f"tools_required={decision.tools_required} | "
+            f"execution_mode={decision.execution_mode.value} | "
+            f"provider={decision.selected_provider}"
         )
 
-        logger.debug(
-            f"[{req_id}] PLAN | steps={len(plan)} "
-            f"preview={[s.get('tool') for s in plan[:3]]}"
-        )
+        # ── Background: queue and return immediately ─────────────────────────
+        if decision.execution_mode.value == "background":
+            from core.task import TaskType
 
-        # ── Conversational fallback ───────────────────────────────────────────
-        if not plan:
-            logger.debug(f"[{req_id}] CHAT_FALLBACK")
+            task = await ctx.task_queue.submit(
+                user_input=user_text,
+                task_type=TaskType.BACKGROUND,
+                tools_required=decision.tools_required,
+                provider_name=decision.selected_provider,
+            )
+
+            logger.info(
+                f"[{req_id}] BACKGROUND_QUEUED | task_id={task.task_id}"
+            )
+
+            ack = (
+                f"✓ Task Accepted\n"
+                f"Task ID: {task.task_id}\n"
+                f"Status: QUEUED. I will notify you when it finishes."
+            )
+            await ctx.memory.conversation.add_interaction("user", user_text)
+            await ctx.memory.conversation.add_interaction("assistant", ack)
+            return {"status": "success", "response": ack}
+
+        # ── Immediate: direct chat, no tools ──────────────────────────────────
+        if not decision.tools_required:
+            logger.debug(f"[{req_id}] CHAT_DIRECT | provider={decision.selected_provider}")
             response = await ctx.brain_router.chat(
-                user_input = user_text,
-                history    = history,
-                trace_id   = req_id,
+                user_input=user_text,
+                history=history,
+                trace_id=req_id,
+                provider_name=decision.selected_provider,
             )
             response = self._sanitize_output(response)
             await ctx.memory.conversation.add_interaction("user", user_text)
             await ctx.memory.conversation.add_interaction("assistant", response)
             return {"status": "success", "response": response}
 
-        # ── Supervised plan execution ─────────────────────────────────────────
-        # AgentSupervisor takes ownership of the execution loop.
-        # It executes steps through ctx.tool_registry (preserving all security
-        # gates), detects failures, requests LLM reflection, and retries up to
-        # MAX_RETRIES times before aborting.
-        #
-        # The Dispatcher receives a single structured result back and writes
-        # it to conversation memory. No execution logic lives here.
+        # ── Interactive: Planner, forced provider, synchronous ────────────────
         logger.info(
-            f"[{req_id}] SUPERVISOR_DELEGATE | "
-            f"Handing {len(plan)} step(s) to AgentSupervisor."
+            f"[{req_id}] PLANNER_DELEGATE | "
+            f"provider={decision.selected_provider} (forced by Decision Engine)"
         )
 
-        supervisor = AgentSupervisor(ctx=ctx, req_id=req_id)
+        planner = Planner(ctx=ctx, req_id=req_id, provider_name=decision.selected_provider)
+        result = await planner.run(user_input=user_text, history=history)
 
-        result = await supervisor.execute_with_reflection(
-            user_input   = user_text,
-            initial_plan = plan,
-        )
-
-        # ── Memory write ──────────────────────────────────────────────────────
-        # Supervisor handles its own trace writes to session state.
-        # Dispatcher writes the final user/assistant exchange to conversation
-        # memory so the turn appears in future LLM context.
         response_text = self._sanitize_output(result.get("response", ""))
-
         await ctx.memory.conversation.add_interaction("user", user_text)
         await ctx.memory.conversation.add_interaction("assistant", response_text)
 
-        return {
-            "status":   result.get("status", "error"),
-            "response": response_text,
-        }
+        return {"status": result.get("status", "error"), "response": response_text}
 
-    # ── Tool Execution Step ───────────────────────────────────────────────────
+    # ── Tool Execution Step (unchanged) ──────────────────────────────────────
 
-    async def _execute_step(
-        self,
-        tool_name: str,
-        args:      dict[str, Any],
-        req_id:    str,
-        ctx:       CyraxContext,
-    ) -> dict[str, Any]:
-        """
-        Executes a single tool through the registry with timeout protection.
-        Used by _execute_intent() (fast-path single tools only).
-
-        Never raises — always returns a structured result dict.
-        Timeout sourced from settings, not hardcoded.
-
-        Note: AgentSupervisor has its own equivalent _execute_step() method
-        that it uses for plan execution. Both route through
-        ctx.tool_registry.execute_tool() so all gates are enforced identically.
-        """
-        logger.info(f"[{req_id}] EXEC | tool={tool_name} args={args}")
-
+    async def _execute_step(self, tool_name: str, args: dict[str, Any], req_id: str, ctx: CyraxContext) -> dict[str, Any]:
         try:
-            result: dict[str, Any] = await asyncio.wait_for(
-                ctx.tool_registry.execute_tool(tool_name, args),
+            return await asyncio.wait_for(
+                ctx.tool_registry.execute_tool(tool_name, args, ctx=ctx),
                 timeout=settings.TOOL_TIMEOUT_SECONDS,
             )
-            logger.debug(
-                f"[{req_id}] EXEC_DONE | "
-                f"tool={tool_name} status={result.get('status')}"
-            )
-            return result
-
         except asyncio.TimeoutError:
-            logger.error(
-                f"[{req_id}] EXEC_TIMEOUT | "
-                f"tool={tool_name} after {settings.TOOL_TIMEOUT_SECONDS}s"
-            )
-            return {
-                "status":   "error",
-                "response": (
-                    f"Tool '{tool_name}' timed out after "
-                    f"{settings.TOOL_TIMEOUT_SECONDS}s."
-                ),
-            }
-
+            return {"status": "error", "response": f"Tool '{tool_name}' timed out after {settings.TOOL_TIMEOUT_SECONDS}s."}
         except Exception as exc:
-            logger.exception(
-                f"[{req_id}] EXEC_CRASH | tool={tool_name} error={exc}"
-            )
-            return {
-                "status":   "error",
-                "response": f"Tool '{tool_name}' encountered an unexpected error.",
-            }
+            logger.exception(f"[{req_id}] EXEC_CRASH | tool={tool_name} error={exc}")
+            return {"status": "error", "response": f"Tool '{tool_name}' encountered an unexpected error."}
 
-    # ── Output Sanitizer ──────────────────────────────────────────────────────
+    # ── Output Sanitizer (unchanged) ─────────────────────────────────────────
 
     @staticmethod
     def _sanitize_output(text: str) -> str:
         if not text or not text.strip():
             return "I couldn't process that request."
-        cleaned = "\n".join(
-            line for line in text.splitlines() if line.strip()
-        )
+        cleaned = "\n".join(line for line in text.splitlines() if line.strip())
         if len(cleaned) > 1500:
             cleaned = cleaned[:1500] + "\n... [Response truncated]"
         return cleaned

@@ -206,7 +206,32 @@ class CyraxSettings(BaseSettings):
 
     # ── Voice ─────────────────────────────────────────────────────────────────
 
+    # OpenAI-compatible STT (e.g., Groq Whisper) configuration
+    OPENAI_API_KEY: str = Field(
+        default="",
+        description=(
+            "OpenAI-compatible API key for STT. When OPENAI_BASE_URL points "
+            "at Groq's endpoint, this is the Groq API key, not an OpenAI one."
+        ),
+    )
+
+    OPENAI_BASE_URL: str | None = Field(
+        default=None,
+        description=(
+            "Optional override for the OpenAI-compatible API base URL. "
+            "Set to Groq's endpoint to route Whisper STT calls through "
+            "Groq's free tier instead of OpenAI directly. "
+            "None uses the openai SDK's default (api.openai.com)."
+        ),
+    )
+
+    OPENAI_STT_MODEL: str = Field(
+        default="whisper-large-v3",
+        description="The Whisper model ID to send to the STT provider (e.g., Groq).",
+    )
+
     TTS_VOICE: str = Field(
+
         default="en-US-JennyNeural",
         description="Edge-TTS neural voice name.",
     )
@@ -231,12 +256,50 @@ class CyraxSettings(BaseSettings):
         description="Maximum seconds for a single spoken phrase.",
     )
 
+    STT_LISTEN_TIMEOUT_SECONDS: int = Field(
+        default=10,
+        description="Max time to wait for speech",
+    )
+
     WAKE_WORD_CONFIDENCE_THRESHOLD: float = Field(
         default=0.5,
         ge=0.1,
         le=1.0,
         description="Minimum OpenWakeWord confidence score to trigger wake.",
     )
+
+    VOICE_MAX_RECORD_SECONDS: int = Field(
+        default=10,
+        ge=1,
+        le=60,
+        description=(
+            "Hard upper bound on a single :voice recording, in seconds. "
+            "AudioCapture.record_audio() must never block past this limit "
+            "even if the microphone backend stalls."
+        ),
+    )
+
+    VOICE_STT_TIMEOUT_SECONDS: int = Field(
+        default=15,
+        ge=1,
+        le=60,
+        description=(
+            "Timeout for the STT API call (OpenAI Whisper endpoint). "
+            "Independent of VOICE_MAX_RECORD_SECONDS — this bounds the "
+            "network round-trip, not the recording itself."
+        ),
+    )
+
+    VOICE_SAMPLE_RATE: int = Field(
+        default=16000,
+        ge=8000,
+        le=48000,
+        description=(
+            "Audio sample rate in Hz for microphone capture. "
+            "16000 Hz matches Whisper's expected input rate."
+        ),
+    )
+
 
     # ── Testing ───────────────────────────────────────────────────────────────
 
