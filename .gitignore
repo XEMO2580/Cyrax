@@ -44,3 +44,34 @@ orchestrator/intent_parser/__pycache__/fast_path.cpython-311.pyc
 orchestrator/__pycache__/dispatcher.cpython-311.pyc
 config/__pycache__/settings.cpython-311.pyc
 app/__pycache__/bootstrap.cpython-311.pyc
+
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# VS Code
+.vscode/
+
+# pytest
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+
+# Ruff
+.ruff_cache/
+
+# Coverage
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
