@@ -47,6 +47,7 @@ from core.context import (
     SecurityProtocol,
     FallbackPolicyProtocol,
 )
+from core.interrupt_controller import InterruptController
 from core.notification_center import NotificationCenter
 from core.task_queue import TaskQueue
 from core.trace import new_trace_id
@@ -341,20 +342,30 @@ def bootstrap() -> CyraxContext:
 
     stdlib_logger.info("Notification center: OK ✓")
 
+    # ── Step 9c: Interrupt Controller ────────────────────────────────────────
+    stdlib_logger.info("Step 9c/10 — Interrupt Controller...")
+    try:
+        interrupt_controller = InterruptController()
+    except Exception as exc:
+        _hard_fail(f"InterruptController initialisation failed: {exc}")
+
+    stdlib_logger.info("Interrupt controller: OK ✓")
+
     # ── Step 10: Assemble CyraxContext ────────────────────────────────────────
     stdlib_logger.info("Step 10/10 — Assembling CyraxContext...")
     try:
         ctx = CyraxContext(
-            session_id          = "device_master_001",
-            dispatcher          = dispatcher,
-            tool_registry       = registry,
-            brain_router        = brain_router,
-            memory              = memory,
-            security            = security_guard,
-            fallback_policy     = fallback_policy,
-            decision_engine     = decision_engine,
-            task_queue          = task_queue,
-            notification_center = notification_center,
+            session_id            = "device_master_001",
+            dispatcher            = dispatcher,
+            tool_registry         = registry,
+            brain_router          = brain_router,
+            memory                = memory,
+            security              = security_guard,
+            fallback_policy       = fallback_policy,
+            decision_engine       = decision_engine,
+            task_queue            = task_queue,
+            notification_center   = notification_center,
+            interrupt_controller  = interrupt_controller,
         )
     except (TypeError, ValueError) as exc:
         _hard_fail(

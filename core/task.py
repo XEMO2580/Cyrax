@@ -1,9 +1,12 @@
 """
-core/task.py — CYRAX 3.0 Task Data Structures (Phase 8.3)
+core/task.py — CYRAX 3.0 Task Data Structures (Phase 8.4)
 
-Phase 8.3 change: Task gains tools_required and provider_name so the
-background TaskExecutor knows how to process a task without re-classifying
-it — the Decision Engine's routing decision travels with the task.
+Phase 8.4 changes:
+  - TaskStatus gains CANCELLING (transitional state between a cancel
+    request being issued and the executor's finally block confirming
+    CANCELLED — lets a get_task() caller distinguish "cancellation in
+    flight" from "already fully stopped").
+  - Task gains interruptible: bool = True (Constraint 3).
 """
 
 from __future__ import annotations
@@ -16,11 +19,12 @@ from pydantic import BaseModel, Field
 
 
 class TaskStatus(str, Enum):
-    PENDING   = "pending"
-    RUNNING   = "running"
-    COMPLETED = "completed"
-    FAILED    = "failed"
-    CANCELLED = "cancelled"
+    PENDING    = "pending"
+    RUNNING    = "running"
+    CANCELLING = "cancelling"
+    COMPLETED  = "completed"
+    FAILED     = "failed"
+    CANCELLED  = "cancelled"
 
 
 class TaskType(str, Enum):
@@ -35,12 +39,10 @@ class Task(BaseModel):
     user_input:       The raw request text this task represents.
     task_type:        IMMEDIATE | BACKGROUND | CRON.
     status:           Current lifecycle state. Starts at PENDING.
-    tools_required:   Carried from CognitiveRoutingDecision — tells the
-                      executor whether to route through Planner or
-                      brain_router.chat() directly, without re-classifying.
-    provider_name:    Carried from CognitiveRoutingDecision.selected_provider —
-                      the executor forces this provider rather than
-                      re-selecting at execution time.
+    tools_required:   Carried from CognitiveRoutingDecision.
+    provider_name:    Carried from CognitiveRoutingDecision.selected_provider.
+    interruptible:    If False, this task ignores cancel()/cancel_all()
+                       requests entirely — it always runs to completion.
     result:           Populated on COMPLETED. None otherwise.
     error:            Populated on FAILED. None otherwise.
     created_at:       UTC timestamp, set once at construction.
@@ -53,6 +55,7 @@ class Task(BaseModel):
     status:          TaskStatus = TaskStatus.PENDING
     tools_required:  bool       = False
     provider_name:   str        = "groq"
+    interruptible:   bool       = True
     result:          str | None = None
     error:           str | None = None
     created_at:      datetime   = Field(default_factory=lambda: datetime.now(timezone.utc))

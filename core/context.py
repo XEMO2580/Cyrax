@@ -1,13 +1,14 @@
 """
-core/context.py — CYRAX 3.0 Dependency Injection Container (Phase 8.3)
+core/context.py — CYRAX 3.0 Dependency Injection Container (Phase 8.4)
 
-Phase 8.3 change: adds NotificationCenterProtocol and notification_center
-field, supporting Pub/Sub delivery of background task outcomes.
+Phase 8.4 changes:
+  - Removed cancel_token: asyncio.Event field entirely — superseded by
+    the per-task CancellationToken registry in InterruptController.
+  - Added InterruptControllerProtocol and interrupt_controller field.
 """
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -102,47 +103,61 @@ class NotificationCenterProtocol(Protocol):
     async def publish(self, event: Any) -> None: ...
 
 
+@runtime_checkable
+class InterruptControllerProtocol(Protocol):
+    """
+    Phase 8.4 — central registry for cancellable running tasks.
+    Concrete implementation: core/interrupt_controller.py's InterruptController.
+    """
+    def register(self, task_id: str, asyncio_task: Any, token: Any, interruptible: bool) -> None: ...
+    def deregister(self, task_id: str) -> None: ...
+    def cancel(self, task_id: str, reason: str) -> bool: ...
+    def cancel_all(self, reason: str) -> list[str]: ...
+
+
 @dataclass(frozen=True)
 class CyraxContext:
     """
     Immutable DI container. Constructed once by bootstrap().
 
     Fields:
-        session_id:           Device/user session identifier.
-        dispatcher:            Orchestrator entry point.
-        tool_registry:         Immutable boot-time tool mount.
-        brain_router:          Unified LLM interface.
-        memory:                Four-tier memory stack.
-        security:              Authentication and session management.
-        fallback_policy:       Declarative tool failure recovery rules.
-        decision_engine:       Phase 7 pre-processor.
-        task_queue:            Phase 8.2 — in-memory background task queue.
-        notification_center:   Phase 8.3 — Pub/Sub broker for task outcomes.
-        cancel_token:          Optional asyncio.Event checked by Planner.
+        session_id:            Device/user session identifier.
+        dispatcher:             Orchestrator entry point.
+        tool_registry:          Immutable boot-time tool mount.
+        brain_router:           Unified LLM interface.
+        memory:                 Four-tier memory stack.
+        security:               Authentication and session management.
+        fallback_policy:        Declarative tool failure recovery rules.
+        decision_engine:        Phase 7 pre-processor.
+        task_queue:             Phase 8.2 — in-memory background task queue.
+        notification_center:    Phase 8.3 — Pub/Sub broker for task outcomes.
+        interrupt_controller:   Phase 8.4 — registry of cancellable running
+                                tasks. Replaces the removed cancel_token field.
     """
-    session_id:          str
-    dispatcher:          DispatcherProtocol
-    tool_registry:        ToolRegistryProtocol
-    brain_router:          BrainRouterProtocol
-    memory:                MemoryStackProtocol
-    security:              SecurityProtocol
-    fallback_policy:       FallbackPolicyProtocol
-    decision_engine:       DecisionEngineProtocol
-    task_queue:            TaskQueueProtocol
-    notification_center:   NotificationCenterProtocol
-    cancel_token:          asyncio.Event | None = None
+    session_id:            str
+    dispatcher:            DispatcherProtocol
+    tool_registry:          ToolRegistryProtocol
+    brain_router:            BrainRouterProtocol
+    memory:                  MemoryStackProtocol
+    security:                SecurityProtocol
+    fallback_policy:         FallbackPolicyProtocol
+    decision_engine:         DecisionEngineProtocol
+    task_queue:              TaskQueueProtocol
+    notification_center:     NotificationCenterProtocol
+    interrupt_controller:    InterruptControllerProtocol
 
     def __post_init__(self) -> None:
         checks = [
-            (self.dispatcher,           DispatcherProtocol,          "dispatcher"),
-            (self.tool_registry,        ToolRegistryProtocol,        "tool_registry"),
-            (self.brain_router,         BrainRouterProtocol,         "brain_router"),
-            (self.memory,               MemoryStackProtocol,         "memory"),
-            (self.security,             SecurityProtocol,            "security"),
-            (self.fallback_policy,      FallbackPolicyProtocol,      "fallback_policy"),
-            (self.decision_engine,      DecisionEngineProtocol,      "decision_engine"),
-            (self.task_queue,           TaskQueueProtocol,           "task_queue"),
-            (self.notification_center,  NotificationCenterProtocol,  "notification_center"),
+            (self.dispatcher,            DispatcherProtocol,            "dispatcher"),
+            (self.tool_registry,         ToolRegistryProtocol,          "tool_registry"),
+            (self.brain_router,          BrainRouterProtocol,           "brain_router"),
+            (self.memory,                MemoryStackProtocol,           "memory"),
+            (self.security,              SecurityProtocol,              "security"),
+            (self.fallback_policy,       FallbackPolicyProtocol,        "fallback_policy"),
+            (self.decision_engine,       DecisionEngineProtocol,        "decision_engine"),
+            (self.task_queue,            TaskQueueProtocol,             "task_queue"),
+            (self.notification_center,   NotificationCenterProtocol,    "notification_center"),
+            (self.interrupt_controller,  InterruptControllerProtocol,   "interrupt_controller"),
         ]
         for instance, protocol, name in checks:
             if not isinstance(instance, protocol):
@@ -153,8 +168,3 @@ class CyraxContext:
                 )
         if not self.session_id or not self.session_id.strip():
             raise ValueError("CyraxContext: 'session_id' cannot be empty.")
-        if self.cancel_token is not None and not isinstance(self.cancel_token, asyncio.Event):
-            raise TypeError(
-                f"CyraxContext: 'cancel_token' must be asyncio.Event or None, "
-                f"got {type(self.cancel_token).__name__}"
-            )

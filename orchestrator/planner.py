@@ -1,20 +1,17 @@
 """
-orchestrator/planner.py — CYRAX 3.0 Phase 7 ReAct Planner
+orchestrator/planner.py — CYRAX 3.0 Phase 8.4.5 ReAct Planner
 
-Phase 7 change:
-  - __init__ gains provider_name: str | None = None. When set (by the
-    Decision Engine's routing decision, via Dispatcher), _think() uses
-    that specific provider for every Think call in this run — including
-    schema-correction retries — instead of the default
-    _get_provider_for_planning() (Groq-preferred) selection.
-
-Everything else unchanged from Phase 6: 5-step ReAct cap, ephemeral
-Scratchpad, Tier-1 FallbackPolicy / Tier-2 LLM-observation failure
-pipeline, cancellation checks before every iteration and tool call.
+Phase 8.4.5 change: _think() no longer calls provider.generate() directly.
+It now calls self._ctx.brain_router.generate(...) — MoERouter's failover-
+wrapped equivalent — so a 429/retryable error during Planner's Think phase
+gets automatic circuit-breaker-aware failover instead of crashing the task.
+_select_provider() is removed; provider_name is passed straight through
+to brain_router.generate() as the requested candidate.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -22,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from config.settings import settings
+from core.interrupt_controller import CancellationToken
 
 logger = logging.getLogger(__name__)
 
@@ -125,10 +123,11 @@ class Planner:
     Args:
         ctx:            CyraxContext.
         req_id:          Trace correlation ID.
-        provider_name:   Optional. When set (Phase 7 — Decision Engine
-                         override), every Think call in this run uses
-                         this specific provider instead of the default
-                         planning-provider selection.
+        provider_name:   Optional. When set (Decision Engine override),
+                         passed through to brain_router.generate() as the
+                         requested first candidate — MoERouter's own
+                         failover logic decides what happens if that
+                         candidate fails, not Planner.
     """
 
     def __init__(self, ctx: Any, req_id: str, provider_name: str | None = None) -> None:
@@ -136,7 +135,12 @@ class Planner:
         self._req_id        = req_id
         self._provider_name = provider_name
 
-    async def run(self, user_input: str, history: list[dict]) -> dict[str, Any]:
+    async def run(
+        self,
+        user_input:    str,
+        history:       list[dict],
+        cancel_token:  CancellationToken | None = None,
+    ) -> dict[str, Any]:
         scratchpad = Scratchpad(user_input=user_input)
         tool_definitions = self._ctx.tool_registry.get_all_definitions()
         valid_tool_names = {t["name"] for t in tool_definitions}
@@ -144,9 +148,12 @@ class Planner:
 
         for step in range(1, MAX_REACT_STEPS + 1):
 
-            if self._is_cancelled():
-                logger.info(f"[{self._req_id}] PLANNER | Cancelled before step {step}.")
-                return {"status": "error", "response": "Task cancelled."}
+            if cancel_token is not None and cancel_token.is_cancelled:
+                logger.info(
+                    f"[{self._req_id}] PLANNER | Cancelled before step {step} "
+                    f"| reason='{cancel_token.reason}'"
+                )
+                raise asyncio.CancelledError(cancel_token.reason)
 
             decision = await self._think(
                 system_prompt=system_prompt, scratchpad=scratchpad,
@@ -175,9 +182,12 @@ class Planner:
                 scratchpad.add(step, thought, tool_name, tool_args, observation)
                 continue
 
-            if self._is_cancelled():
-                logger.info(f"[{self._req_id}] PLANNER | Cancelled before tool call at step {step}.")
-                return {"status": "error", "response": "Task cancelled."}
+            if cancel_token is not None and cancel_token.is_cancelled:
+                logger.info(
+                    f"[{self._req_id}] PLANNER | Cancelled before tool call "
+                    f"at step {step} | reason='{cancel_token.reason}'"
+                )
+                raise asyncio.CancelledError(cancel_token.reason)
 
             observation, auth_required_result = await self._act(
                 tool_name=tool_name, tool_args=tool_args, step=step,
@@ -194,31 +204,11 @@ class Planner:
             "response": "System Error: Task exceeded maximum reasoning steps.",
         }
 
-    # ── Think phase ───────────────────────────────────────────────────────────
-
-    def _select_provider(self) -> Any:
-        """
-        Phase 7: if provider_name was forced by the Decision Engine, look
-        it up on brain_router directly. Falls back to the default planning
-        provider if no override was given, or if the forced name isn't a
-        recognised provider (fail-safe, not a hard crash).
-        """
-        if self._provider_name:
-            provider = getattr(self._ctx.brain_router, "_providers", {}).get(self._provider_name)
-            if provider is not None:
-                return provider
-            logger.warning(
-                f"[{self._req_id}] PLANNER | "
-                f"Forced provider '{self._provider_name}' not found on brain_router. "
-                f"Falling back to default planning provider."
-            )
-        return self._ctx.brain_router._get_provider_for_planning()
+    # ── Think phase — Phase 8.4.5: routed through MoERouter.generate() ──────
 
     async def _think(
         self, system_prompt: str, scratchpad: Scratchpad, history: list[dict], step: int,
     ) -> dict[str, Any] | None:
-        provider = self._select_provider()
-
         transcript = scratchpad.render_for_llm()
         recent_history = history[-4:]
 
@@ -230,12 +220,18 @@ class Planner:
 
         messages = recent_history + [{"role": "user", "content": user_message}]
 
-        raw = await provider.generate(
+        # Routed through MoERouter.generate() — gains circuit-breaker
+        # awareness and automatic failover on a retryable ProviderError,
+        # instead of calling a single provider's generate() directly.
+        raw = await self._ctx.brain_router.generate(
             messages=messages,
             system_prompt=system_prompt,
             max_tokens=400,
             temperature=0.0,
-            json_mode=provider.capabilities.supports_json_mode,
+            json_mode=True,
+            provider_name=self._provider_name,
+            intent="react_think",
+            trace_id=self._req_id,
         )
 
         parsed = self._parse_decision(raw)
@@ -250,14 +246,15 @@ class Planner:
             correction_prompt = _build_schema_correction_prompt(
                 bad_output=raw, parse_error="Invalid JSON structure or missing keys."
             )
-            # Same forced provider used for the correction retry — do not
-            # silently fall back to a different provider mid-run.
-            raw = await provider.generate(
+            raw = await self._ctx.brain_router.generate(
                 messages=[{"role": "user", "content": correction_prompt}],
                 system_prompt=system_prompt,
                 max_tokens=400,
                 temperature=0.0,
-                json_mode=provider.capabilities.supports_json_mode,
+                json_mode=True,
+                provider_name=self._provider_name,
+                intent="react_think_correction",
+                trace_id=self._req_id,
             )
             parsed = self._parse_decision(raw)
             if parsed is not None:
@@ -329,7 +326,6 @@ class Planner:
         return observation, None
 
     async def _execute_step(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
-        import asyncio
         try:
             return await asyncio.wait_for(
                 self._ctx.tool_registry.execute_tool(tool_name, args, ctx=self._ctx),
@@ -343,9 +339,3 @@ class Planner:
         except Exception as exc:
             logger.exception(f"[{self._req_id}] PLANNER | Unexpected error in {tool_name}: {exc}")
             return {"status": "error", "response": f"Tool '{tool_name}' encountered an unexpected error."}
-
-    def _is_cancelled(self) -> bool:
-        cancel_token = getattr(self._ctx, "cancel_token", None)
-        if cancel_token is None:
-            return False
-        return cancel_token.is_set()

@@ -150,18 +150,27 @@ class Dispatcher:
 
     async def _llm_pipeline(self, user_text: str, req_id: str, ctx: CyraxContext) -> dict[str, Any]:
         """
-        Decision Engine gates every non-fast-path query. Phase 8.3 adds
-        execution_mode routing on top of the existing tools_required gate:
-
-            immediate | interactive -> synchronous, exactly as before
-                (immediate  -> chat via selected_provider)
-                (interactive -> Planner forced onto selected_provider, if
-                                 tools_required; else chat)
-            background -> submitted to ctx.task_queue, NOT awaited.
-                Returns an acknowledgement immediately; TaskExecutor
-                processes it and NotificationCenter delivers the result
-                later — this method never blocks on background work.
+        Phase 8.4: hardcoded system interceptor for stop/cancel/abort
+        runs FIRST, before the Decision Engine is ever called — Constraint 2.
         """
+        stripped_lower = user_text.strip().lower()
+
+        if stripped_lower in {"stop", "cancel", "abort"}:
+            cancelled_ids = ctx.interrupt_controller.cancel_all(
+                "User triggered global stop."
+            )
+            count = len(cancelled_ids)
+
+            if count == 0:
+                response = "No running tasks to stop."
+            else:
+                response = f"✓ Stopped {count} running task(s)."
+
+            await ctx.memory.conversation.add_interaction("user", user_text)
+            await ctx.memory.conversation.add_interaction("assistant", response)
+            return {"status": "success", "response": response}
+
+        # ── Everything below unchanged from Phase 8.3 ─────────────────────────
         history = ctx.memory.conversation.get_history()
 
         decision = await ctx.decision_engine.classify(user_text)

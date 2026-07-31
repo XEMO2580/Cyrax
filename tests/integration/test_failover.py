@@ -51,7 +51,7 @@ class TestMoERouterFailover:
         groq = _make_mock_provider("groq")
         groq.generate.return_value = "Fallback successful"
 
-        router = MoERouter(providers={"gemini": gemini, "groq": groq})
+        router = MoERouter(providers={"gemini": gemini, "groq": groq}, metrics_manager=Mock())
 
         with caplog.at_level("WARNING"):
             result = await router.chat(
@@ -84,7 +84,7 @@ class TestMoERouterFailover:
         groq = _make_mock_provider("groq")
         groq.generate.return_value = "Should never be reached"
 
-        router = MoERouter(providers={"gemini": gemini, "groq": groq})
+        router = MoERouter(providers={"gemini": gemini, "groq": groq}, metrics_manager=Mock())
 
         result = await router.chat(
             user_input="hello",
@@ -114,7 +114,7 @@ class TestMoERouterFailover:
         groq = _make_mock_provider("groq")
         groq.generate.return_value = "Should never be reached"
 
-        router = MoERouter(providers={"gemini": gemini, "groq": groq})
+        router = MoERouter(providers={"gemini": gemini, "groq": groq}, metrics_manager=Mock())
 
         result = await router.chat(
             user_input="hello",
@@ -145,7 +145,7 @@ class TestMoERouterFailover:
             "Service unavailable", provider="groq", status_code=503, retryable=True,
         )
 
-        router = MoERouter(providers={"gemini": gemini, "groq": groq})
+        router = MoERouter(providers={"gemini": gemini, "groq": groq}, metrics_manager=Mock())
 
         result = await router.chat(
             user_input="hello",
@@ -157,3 +157,4 @@ class TestMoERouterFailover:
         gemini.generate.assert_awaited_once()
         groq.generate.assert_awaited_once()
         assert "trouble" in result.lower() or "try again" in result.lower()
+

@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from orchestrator.dispatcher import Dispatcher
+from orchestrator.decision_engine import CognitiveRoutingDecision, ExecutionMode
 
 pytestmark = pytest.mark.asyncio
 
@@ -55,9 +56,27 @@ def mock_ctx() -> Mock:
     ctx.brain_router = Mock(name="BrainRouter")
     ctx.brain_router.plan = AsyncMock(return_value=[])
     ctx.brain_router.chat = AsyncMock(return_value="Conversational response.")
+    ctx.brain_router.generate = AsyncMock(
+        return_value='{"thought": "done", "action": null, "action_args": {}, "final_answer": "Done."}'
+    )
 
     ctx.fallback_policy = Mock(name="FallbackPolicy")
     ctx.fallback_policy.get_fallback.return_value = None
+
+    ctx.decision_engine = Mock(name="DecisionEngine")
+    ctx.decision_engine.classify = AsyncMock(
+        return_value=CognitiveRoutingDecision(
+            intent="GENERAL_CHAT",
+            tools_required=False,
+            selected_provider="groq",
+            execution_mode=ExecutionMode.IMMEDIATE,
+            confidence=1.0,
+            reason="General chat.",
+        )
+    )
+
+    ctx.interrupt_controller = Mock(name="InterruptController")
+    ctx.interrupt_controller.cancel_all.return_value = []
 
     return ctx
 
@@ -145,7 +164,7 @@ class TestFastPathRoute:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LLM plan route
+# LLM plan route — now routes through Decision Engine + Planner (ReAct)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestLLMPlanRoute:
@@ -153,21 +172,35 @@ class TestLLMPlanRoute:
     async def test_valid_plan_invokes_agent_supervisor(
         self, dispatcher: Dispatcher, mock_ctx: Mock
     ) -> None:
-        mock_ctx.brain_router.plan = AsyncMock(
-            return_value=[{"tool": "OPEN_APP", "args": {"app": "chrome"}}]
+        """
+        The Dispatcher now routes through the Decision Engine and Planner.
+        This test verifies that when the decision engine returns
+        tools_required=True / execution_mode=INTERACTIVE, the Planner is
+        instantiated and invoked correctly.
+        """
+        mock_ctx.decision_engine.classify = AsyncMock(
+            return_value=CognitiveRoutingDecision(
+                intent="OS_CONTROL",
+                tools_required=True,
+                selected_provider="groq",
+                execution_mode=ExecutionMode.INTERACTIVE,
+                confidence=1.0,
+                reason="OS control action detected.",
+            )
         )
 
-        mock_supervisor_instance = Mock()
-        mock_supervisor_instance.execute_with_reflection = AsyncMock(
+        mock_planner_instance = Mock()
+        mock_planner_instance.run = AsyncMock(
             return_value={"status": "success", "response": "I successfully executed: OPEN_APP."}
         )
-        mock_supervisor_class = Mock(return_value=mock_supervisor_instance)
+
+        mock_planner_class = Mock(return_value=mock_planner_instance)
 
         with patch(
             "orchestrator.intent_parser.fast_path.IntentRouter.parse",
             return_value=None,
         ), patch(
-            "orchestrator.dispatcher.AgentSupervisor", mock_supervisor_class
+            "orchestrator.dispatcher.Planner", mock_planner_class
         ):
             result = await dispatcher.handle(
                 user_input="open chrome and search RTX 5090",
@@ -177,19 +210,32 @@ class TestLLMPlanRoute:
             )
 
         assert result["status"] == "success"
-        mock_supervisor_class.assert_called_once()
-        _, kwargs = mock_supervisor_class.call_args
+        mock_planner_class.assert_called_once()
+        _, kwargs = mock_planner_class.call_args
         assert kwargs["ctx"] is mock_ctx
-        mock_supervisor_instance.execute_with_reflection.assert_awaited_once()
+        mock_planner_instance.run.assert_awaited_once()
 
     async def test_supervisor_receives_initial_plan_from_brain_router(
         self, dispatcher: Dispatcher, mock_ctx: Mock
     ) -> None:
-        expected_plan = [{"tool": "OPEN_APP", "args": {"app": "brave"}}]
-        mock_ctx.brain_router.plan = AsyncMock(return_value=expected_plan)
+        """
+        The Planner receives the user_input and history. The initial plan
+        comes from brain_router.plan() which is called inside the Dispatcher's
+        _llm_pipeline before the Planner is invoked.
+        """
+        mock_ctx.decision_engine.classify = AsyncMock(
+            return_value=CognitiveRoutingDecision(
+                intent="OS_CONTROL",
+                tools_required=True,
+                selected_provider="groq",
+                execution_mode=ExecutionMode.INTERACTIVE,
+                confidence=1.0,
+                reason="OS control action detected.",
+            )
+        )
 
-        mock_supervisor_instance = Mock()
-        mock_supervisor_instance.execute_with_reflection = AsyncMock(
+        mock_planner_instance = Mock()
+        mock_planner_instance.run = AsyncMock(
             return_value={"status": "success", "response": "Done."}
         )
 
@@ -197,8 +243,8 @@ class TestLLMPlanRoute:
             "orchestrator.intent_parser.fast_path.IntentRouter.parse",
             return_value=None,
         ), patch(
-            "orchestrator.dispatcher.AgentSupervisor",
-            return_value=mock_supervisor_instance,
+            "orchestrator.dispatcher.Planner",
+            return_value=mock_planner_instance,
         ):
             await dispatcher.handle(
                 user_input="open brave",
@@ -207,8 +253,9 @@ class TestLLMPlanRoute:
                 ctx=mock_ctx,
             )
 
-        _, call_kwargs = mock_supervisor_instance.execute_with_reflection.call_args
-        assert call_kwargs["initial_plan"] == expected_plan
+        mock_planner_instance.run.assert_awaited_once()
+        _, call_kwargs = mock_planner_instance.run.call_args
+        assert call_kwargs["user_input"] == "open brave"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -234,7 +281,7 @@ class TestAuthRequiredAndResumeFlow:
             return_value=mock_parsed,
         ):
             result = await dispatcher.handle(
-                user_input="restart",  # <-- CHANGE "shutdown" to "restart"
+                user_input="restart",
                 session_id="test_session",
                 trace_id="trace123",
                 ctx=mock_ctx,
@@ -387,7 +434,21 @@ class TestEmptyPlanChatFallback:
     async def test_empty_plan_falls_back_to_chat(
         self, dispatcher: Dispatcher, mock_ctx: Mock
     ) -> None:
-        mock_ctx.brain_router.plan = AsyncMock(return_value=[])
+        """
+        When the decision engine returns tools_required=False and
+        execution_mode=IMMEDIATE, the dispatcher should route to
+        brain_router.chat() directly (chat fallback).
+        """
+        mock_ctx.decision_engine.classify = AsyncMock(
+            return_value=CognitiveRoutingDecision(
+                intent="GENERAL_CHAT",
+                tools_required=False,
+                selected_provider="groq",
+                execution_mode=ExecutionMode.IMMEDIATE,
+                confidence=1.0,
+                reason="Simple greeting.",
+            )
+        )
         mock_ctx.brain_router.chat = AsyncMock(return_value="Hello, how can I help?")
 
         with patch(
@@ -409,7 +470,21 @@ class TestEmptyPlanChatFallback:
     async def test_chat_fallback_writes_conversation_memory(
         self, dispatcher: Dispatcher, mock_ctx: Mock
     ) -> None:
-        mock_ctx.brain_router.plan = AsyncMock(return_value=[])
+        """
+        When the decision engine says tools_required=False, the conversation
+        memory should still be written.
+        """
+        mock_ctx.decision_engine.classify = AsyncMock(
+            return_value=CognitiveRoutingDecision(
+                intent="GENERAL_CHAT",
+                tools_required=False,
+                selected_provider="groq",
+                execution_mode=ExecutionMode.IMMEDIATE,
+                confidence=1.0,
+                reason="Simple chat.",
+            )
+        )
+        mock_ctx.brain_router.chat = AsyncMock(return_value="I am CYRAX.")
 
         with patch(
             "orchestrator.intent_parser.fast_path.IntentRouter.parse",
@@ -427,14 +502,27 @@ class TestEmptyPlanChatFallback:
     async def test_chat_fallback_does_not_instantiate_supervisor(
         self, dispatcher: Dispatcher, mock_ctx: Mock
     ) -> None:
-        mock_ctx.brain_router.plan = AsyncMock(return_value=[])
-        mock_supervisor_class = Mock()
+        """
+        When the decision engine returns tools_required=False, the Planner
+        should NOT be instantiated — the request goes directly to chat.
+        """
+        mock_ctx.decision_engine.classify = AsyncMock(
+            return_value=CognitiveRoutingDecision(
+                intent="GENERAL_CHAT",
+                tools_required=False,
+                selected_provider="groq",
+                execution_mode=ExecutionMode.IMMEDIATE,
+                confidence=1.0,
+                reason="Simple greeting.",
+            )
+        )
+        mock_planner_class = Mock()
 
         with patch(
             "orchestrator.intent_parser.fast_path.IntentRouter.parse",
             return_value=None,
         ), patch(
-            "orchestrator.dispatcher.AgentSupervisor", mock_supervisor_class
+            "orchestrator.dispatcher.Planner", mock_planner_class
         ):
             await dispatcher.handle(
                 user_input="hello",
@@ -443,4 +531,4 @@ class TestEmptyPlanChatFallback:
                 ctx=mock_ctx,
             )
 
-        mock_supervisor_class.assert_not_called()
+        mock_planner_class.assert_not_called()

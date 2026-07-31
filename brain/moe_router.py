@@ -482,6 +482,128 @@ class MoERouter:
             "Please try again shortly."
         )
 
+    # ── Phase 8.4.5: generate() — failover-wrapped provider call ────────────
+
+    async def generate(
+        self,
+        messages:       list[dict],
+        system_prompt:  str,
+        *,
+        max_tokens:     int = 800,
+        temperature:    float = 0.7,
+        json_mode:      bool = False,
+        provider_name:  str | None = None,
+        intent:         str = "unknown",
+        trace_id:       str = "",
+    ) -> str:
+        """
+        Failover-wrapped equivalent of BaseProvider.generate(). Used by
+        Planner instead of calling a provider's generate() directly, so
+        Planner's ReAct Think calls get circuit-breaker protection and
+        automatic failover on a retryable ProviderError (e.g. 429),
+        exactly as chat() already provides for conversational turns.
+
+        Raises:
+            Nothing. Same never-raises contract as chat() — on total
+            failover exhaustion, returns a plain-string error message
+            rather than propagating a ProviderError, since Planner's
+            _parse_decision() expects a string it can attempt to parse
+            as JSON (a graceful-degradation string will simply fail
+            parsing and trigger Planner's existing schema-retry path,
+            rather than crashing the task outright).
+        """
+        candidates = self._build_failover_candidates(provider_name)
+
+        last_error: ProviderError | None = None
+
+        for index, candidate_name in enumerate(candidates):
+            provider = self._providers.get(candidate_name)
+            if provider is None:
+                logger.warning(
+                    f"[{trace_id}] MOE_ROUTER | "
+                    f"Candidate provider '{candidate_name}' not registered. Skipping."
+                )
+                continue
+
+            start = time.monotonic()
+
+            try:
+                response = await provider.generate(
+                    messages=messages,
+                    system_prompt=system_prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    json_mode=json_mode and provider.capabilities.supports_json_mode,
+                )
+                latency_ms = (time.monotonic() - start) * 1000
+
+                self._metrics.record_event(ProviderExecutionEvent(
+                    provider=candidate_name,
+                    intent=intent,
+                    latency_ms=latency_ms,
+                    success=True,
+                    status_code=200,
+                ))
+
+                if index > 0:
+                    logger.info(
+                        f"[{trace_id}] MOE_ROUTER | "
+                        f"generate() failover recovery succeeded via "
+                        f"'{candidate_name}' after {index} prior failure(s)."
+                    )
+                return response
+
+            except ProviderError as exc:
+                latency_ms = (time.monotonic() - start) * 1000
+                last_error = exc
+
+                self._metrics.record_event(ProviderExecutionEvent(
+                    provider=candidate_name,
+                    intent=intent,
+                    latency_ms=latency_ms,
+                    success=False,
+                    status_code=exc.status_code,
+                ))
+
+                if not exc.retryable:
+                    logger.error(
+                        f"[{trace_id}] MOE_ROUTER | "
+                        f"generate(): non-retryable error from '{candidate_name}' "
+                        f"(status={exc.status_code}): {exc}. Hard stop — no failover."
+                    )
+                    return (
+                        f'{{"thought": "Provider error", "action": null, '
+                        f'"action_args": {{}}, "final_answer": '
+                        f'"I hit a configuration issue with the \'{candidate_name}\' provider and cannot continue."}}'
+                    )
+
+                next_candidate = candidates[index + 1] if index + 1 < len(candidates) else None
+
+                if next_candidate:
+                    logger.warning(
+                        f"[FAILOVER] [{trace_id}] "
+                        f"generate(): provider '{candidate_name}' failed "
+                        f"(status={exc.status_code}, retryable=True): {exc}. "
+                        f"Switching to '{next_candidate}'."
+                    )
+                else:
+                    logger.error(
+                        f"[FAILOVER] [{trace_id}] "
+                        f"generate(): provider '{candidate_name}' failed "
+                        f"(status={exc.status_code}, retryable=True): {exc}. "
+                        f"No further providers available — failover chain exhausted."
+                    )
+
+        logger.error(
+            f"[{trace_id}] MOE_ROUTER | "
+            f"generate(): all providers exhausted. Last error: {last_error!r}"
+        )
+        return (
+            '{"thought": "All providers unavailable", "action": null, '
+            '"action_args": {}, "final_answer": '
+            '"I am unable to reach any AI provider right now. Please try again shortly."}'
+        )
+
     def _build_failover_candidates(self, provider_name: str | None) -> list[str]:
         """
         Builds the ordered candidate list: the requested provider first
