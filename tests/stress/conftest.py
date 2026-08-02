@@ -13,6 +13,7 @@ import pytest
 
 from core.interrupt_controller import InterruptController
 from core.notification_center import NotificationCenter
+from core.resource_manager import ResourceManager
 from core.task_queue import TaskQueue
 
 
@@ -41,6 +42,62 @@ class FakeToolRegistry:
 
     async def execute_tool(self, tool_name: str, args: dict, ctx=None) -> dict:
         return {"status": "success", "response": "Fake tool result."}
+
+
+class FakeJobStore:
+    """
+    Phase 8.5 — minimal in-memory stand-in for SQLiteJobStore so the
+    TaskQueue(job_store=...) constructor contract is satisfied in tests.
+
+    Phase 7.3 — also exposes the routing_history surface (record_routing_
+    outcome / get_routing_stats) so the dispatcher can record outcomes
+    against this fake during stress tests without touching disk.
+    """
+
+    def __init__(self) -> None:
+        self._jobs: dict[str, dict] = {}
+        self.routing_history: list[dict] = []
+
+    async def init(self) -> None:
+        pass
+
+    async def close(self) -> None:
+        pass
+
+    async def insert_job(self, task) -> None:
+        self._jobs[task.task_id] = task
+
+    async def update_status(self, job_id, status, result=None, error=None) -> None:
+        if job_id in self._jobs:
+            self._jobs[job_id].status = status
+
+    async def get_due_jobs(self) -> list:
+        return []
+
+    async def recover_pending_jobs(self) -> list:
+        return []
+
+    async def record_routing_outcome(
+        self, intent_family, provider, success, latency_ms,
+        fallback_used=False, reason="",
+    ) -> None:
+        self.routing_history.append(
+            {
+                "intent_family": intent_family,
+                "provider":      provider,
+                "success":       success,
+                "latency_ms":    latency_ms,
+                "fallback_used": fallback_used,
+                "reason":        reason,
+            }
+        )
+
+    async def get_routing_stats(self, intent_family, limit=200) -> list:
+        rows = [
+            r for r in self.routing_history
+            if r["intent_family"] == intent_family
+        ]
+        return rows[:limit]
 
 
 class FakeFallbackPolicy:
@@ -81,16 +138,19 @@ def mock_ctx(fake_moe_router: FakeMoERouter) -> Mock:
     ctx.tool_registry         = FakeToolRegistry()
     ctx.fallback_policy       = FakeFallbackPolicy()
     ctx.memory                = FakeMemoryStack()
-    ctx.task_queue            = TaskQueue()
+    ctx.job_store             = FakeJobStore()
+    ctx.task_queue            = TaskQueue(job_store=ctx.job_store)
     ctx.interrupt_controller  = InterruptController()
     ctx.notification_center   = NotificationCenter()
+    ctx.resource_manager      = ResourceManager()
+    ctx.learning_router       = AsyncMock()
 
     return ctx
 
 
 @pytest.fixture
 def task_queue() -> TaskQueue:
-    return TaskQueue()
+    return TaskQueue(job_store=FakeJobStore())
 
 
 @pytest.fixture

@@ -1,9 +1,14 @@
 """
-orchestrator/executor.py — CYRAX 3.0 Phase 8.4 Background Task Executor
+orchestrator/executor.py — CYRAX 3.0 Background Task Executor (Phase 8.6)
 
-_process_task now wraps actual execution in an inner asyncio.Task,
-registers it with ctx.interrupt_controller, and handles CancelledError
-explicitly with a finally-block deregistration — Constraint 1.
+Phase 8.6 change: _process_task acquires ctx.resource_manager
+.background_semaphore BEFORE executing work, releases in finally —
+bounds Lane B to MAX_BACKGROUND_WORKERS regardless of how many tasks
+the PriorityQueue hands out.
+
+Constraint 1 held: the worker loop itself (get_pending, dequeue) is not
+gated — only actual EXECUTION is. This matters because dequeuing doesn't
+consume a "worker slot," only running the task's LLM/tool work does.
 """
 
 from __future__ import annotations
@@ -68,29 +73,40 @@ class TaskExecutor:
                     )
                     continue
 
-                await self._ctx.task_queue.update_status(task.task_id, TaskStatus.RUNNING)
-                await self._process_task(task)
+                # Dequeue and status flip are NOT gated by the background
+                # semaphore — only actual execution consumes a worker slot.
+                # This means many tasks can be RUNNING-pending-acquisition
+                # simultaneously; only MAX_BACKGROUND_WORKERS will be
+                # actively executing at once.
+                asyncio.create_task(
+                    self._process_task_bounded(task), name=f"task-bounded-{task.task_id}"
+                )
 
         except asyncio.CancelledError:
             logger.info("[TASK_EXECUTOR] Worker loop cancelled — exiting cleanly.")
             raise
 
-    async def _process_task(self, task: Task) -> None:
+    async def _process_task_bounded(self, task: Task) -> None:
         """
-        Wraps actual execution in an inner asyncio.Task registered with
-        InterruptController, so Dispatcher's "stop"/"cancel"/"abort"
-        interceptor (via cancel_all) can reach it without TaskExecutor
-        and Dispatcher depending on each other directly.
+        Acquires the background semaphore before doing any real work,
+        releases in finally. Separated from _process_task so the semaphore
+        boundary is unambiguous — everything inside this method's `async
+        with` block counts toward the MAX_BACKGROUND_WORKERS cap.
+        """
+        await self._ctx.task_queue.update_status(task.task_id, TaskStatus.RUNNING)
 
-        try/except CancelledError/finally per Constraint 1: cleanup
-        (deregistration) always happens, cancellation is never silently
-        swallowed, and the task's terminal status always reflects what
-        actually happened.
-        """
+        async with self._ctx.resource_manager.background_semaphore:
+            await self._ctx.resource_manager.mark_worker_started()
+            try:
+                await self._process_task(task)
+            finally:
+                await self._ctx.resource_manager.mark_worker_finished()
+
+    async def _process_task(self, task: Task) -> None:
         token = CancellationToken()
 
         inner_task = asyncio.create_task(
-            self._execute_work(task, token), name=f"task-work-{task.task_id}"
+            self._execute_work(task), name=f"task-work-{task.task_id}"
         )
 
         self._ctx.interrupt_controller.register(
@@ -145,9 +161,6 @@ class TaskExecutor:
                 payload=reason,
             ))
             logger.info(f"[TASK_EXECUTOR] Task {task.task_id} cancelled | reason='{reason}'")
-            # Do NOT re-raise — the worker loop's own while-condition governs
-            # its lifecycle; a single task's cancellation must not propagate
-            # and kill the loop that's meant to keep processing other tasks.
 
         except Exception as exc:
             logger.exception(f"[TASK_EXECUTOR] Task {task.task_id} crashed: {exc}")
@@ -165,12 +178,7 @@ class TaskExecutor:
         finally:
             self._ctx.interrupt_controller.deregister(task.task_id)
 
-    async def _execute_work(self, task: Task, token: CancellationToken) -> tuple[str, bool]:
-        """
-        The actual routing logic, isolated into its own coroutine so it
-        can be wrapped in an asyncio.Task for InterruptController to hold
-        a cancellable handle on. Returns (response_text, succeeded).
-        """
+    async def _execute_work(self, task: Task) -> tuple[str, bool]:
         history = self._ctx.memory.conversation.get_history()
 
         if task.tools_required:
@@ -179,11 +187,7 @@ class TaskExecutor:
                 req_id=f"task:{task.task_id}",
                 provider_name=task.provider_name,
             )
-            result = await planner.run(
-                user_input=task.user_input,
-                history=history,
-                cancel_token=token,
-            )
+            result = await planner.run(user_input=task.user_input, history=history)
             return result.get("response", ""), result.get("status") == "success"
 
         response = await self._ctx.brain_router.chat(
@@ -193,3 +197,4 @@ class TaskExecutor:
             provider_name=task.provider_name,
         )
         return response, True
+

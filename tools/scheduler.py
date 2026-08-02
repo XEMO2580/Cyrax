@@ -1,18 +1,26 @@
-"""Compatibility shim.
+"""
+tools/scheduler.py — CYRAX 3.0 Phase 8.5 Job Scheduling Tool
 
-The test suite (and external callers) import `tools.scheduler`, but this
-repo's implementation lives in `tools/schedular.py` (legacy misspelling).
+Zero-sleep architecture (Constraint 3). execute() writes a SCHEDULED
+job to ctx.job_store with a future scheduled_at timestamp and returns
+immediately. The polling JobScheduler (core/job_scheduler.py) picks it
+up on its next 1-second tick — no per-call asyncio.sleep(delay_seconds)
+holding a thread open.
+
+Phase 8.5 fix:
+  - execute() is now async, so it runs directly on the event loop via
+    ToolRegistry's async-tool path — no threading bridge, no _loop
+    injection, no asyncio.run_coroutine_threadsafe().
+  - The request is classified through ctx.decision_engine BEFORE the job
+    is saved, so the Task carries the correct tools_required and
+    provider_name. When the job fires, TaskExecutor routes it to the
+    Planner (not plain chat) if tools are needed.
 """
 
 from __future__ import annotations
 
-# This legacy-misspelled module is the real implementation of the
-# scheduler tool (the name was fixed later via tools/scheduler.py shim).
-
-import asyncio
-import json
 import logging
-from typing import Any
+from datetime import datetime, timedelta, timezone
 
 from pydantic import BaseModel, Field
 
@@ -22,87 +30,82 @@ from tools.registry import BaseTool
 logger = logging.getLogger(__name__)
 
 _MAX_DELAY_SECONDS: int = 3600
-_MAX_ARGS_STR_LEN: int = 2000
-
-_SCHEDULABLE_LEVELS: frozenset[SecurityLevel] = frozenset({
-    SecurityLevel.UNRESTRICTED,
-    SecurityLevel.USER,
-})
 
 
 class ScheduleTaskSchema(BaseModel):
-    tool_name: str = Field(..., description="Registered UNRESTRICTED or USER tool name.")
-    args: dict[str, Any] = Field(default_factory=dict, description="Args for the target tool.")
-    delay_seconds: int = Field(..., ge=1, le=_MAX_DELAY_SECONDS, description="Delay in seconds.")
+    user_input: str = Field(
+        ...,
+        description="The natural-language request to execute later (e.g. 'search the web for X').",
+    )
+    delay_seconds: int = Field(
+        ...,
+        ge=1,
+        le=_MAX_DELAY_SECONDS,
+        description=f"Seconds from now to run this. Max {_MAX_DELAY_SECONDS}.",
+    )
 
 
 class ScheduleTaskTool(BaseTool):
-    name = "SCHEDULE_TASK"
-    description = (
-        "Schedules a registered UNRESTRICTED or USER-level tool to execute after a specified delay. "
-        "ADMIN-level tools cannot be scheduled."
+    """
+    Schedules a future request via the persistent job store.
+
+    Zero sleeping threads: this tool performs one classification + one
+    DB write and returns. The JobScheduler's polling loop is the only
+    thing that ever waits.
+
+    Requires self._ctx (injected by ToolRegistry.execute_tool(ctx=ctx)),
+    same pattern as the Phase-3/Phase-8 context-aware tools. execute()
+    is async — the registry detects coroutine functions and awaits them
+    directly on the event loop.
+    """
+
+    name           = "SCHEDULE_TASK"
+    description    = (
+        "Schedules a natural-language request to run automatically after "
+        "a delay. Returns immediately with a Job ID."
     )
     security_level = SecurityLevel.USER
-    args_schema = ScheduleTaskSchema
+    args_schema    = ScheduleTaskSchema
 
-    def execute(self, tool_name: str, args: dict[str, Any], delay_seconds: int) -> str:  # type: ignore[override]
+    async def execute(self, user_input: str, delay_seconds: int) -> str:  # type: ignore[override]
         ctx = getattr(self, "_ctx", None)
         if ctx is None:
-            return "Error: CyraxContext was not injected into ScheduleTaskTool."
-
-        loop: asyncio.AbstractEventLoop | None = getattr(self, "_loop", None)
-        if loop is None:
-            return "Error: Event loop was not injected into ScheduleTaskTool."
-
-        if not loop.is_running():
-            return "Error: The injected event loop is no longer running."
-
-        tool_names = ctx.tool_registry.get_tool_names()
-        if tool_name not in tool_names:
-            return f"Error: Tool '{tool_name}' is not registered."
-
-        tool_metadata = ctx.tool_registry.get_tool_metadata(tool_name)
-        if tool_metadata is None:
-            return f"Error: Could not retrieve metadata for tool '{tool_name}'."
-
-        target_level: SecurityLevel = tool_metadata.get("security_level", SecurityLevel.ADMIN)
-        if target_level not in _SCHEDULABLE_LEVELS:
             return (
-                "Error: ADMIN-level tools cannot be scheduled for background execution. "
-                f"'{tool_name}' requires SecurityLevel.ADMIN."
+                "Error: ScheduleTaskTool requires a CyraxContext but none "
+                "was injected. Ensure ToolRegistry.execute_tool() passes ctx."
             )
+
+        # Classify the input so the background task knows if it needs tools
+        decision = await ctx.decision_engine.classify(user_input)
+
+        future_time = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+
+        from core.task import Task, TaskStatus, TaskType
+        job = Task(
+            user_input=user_input,
+            task_type=TaskType.CRON,
+            status=TaskStatus.SCHEDULED,
+            scheduled_at=future_time,
+            tools_required=decision.tools_required,
+            provider_name=decision.selected_provider
+        )
 
         try:
-            args_str = json.dumps(args)
-        except (TypeError, ValueError) as exc:
-            return f"Error: Args are not JSON-serialisable — {exc}"
-
-        if len(args_str) > _MAX_ARGS_STR_LEN:
-            return "Error: Args payload is too large"
-
-        frozen_args = dict(args)
-        self._loop.call_soon_threadsafe(
-            lambda: asyncio.ensure_future(
-                _delayed_dispatch(
-                    ctx=ctx,
-                    tool_name=tool_name,
-                    args=frozen_args,
-                    delay_seconds=delay_seconds,
-                )
-            )
-        )
+            await ctx.job_store.insert_job(job)
+        except Exception as exc:
+            logger.error(f"[SCHEDULE_TASK] Failed to insert job: {exc}")
+            return f"Error: Could not schedule task — {exc}"
 
         minutes, seconds = divmod(delay_seconds, 60)
         time_desc = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
-        return f"Success: '{tool_name}' scheduled to run in {time_desc}."
 
+        logger.info(
+            f"[SCHEDULE_TASK] Job {job.task_id} scheduled for {future_time.isoformat()} "
+            f"(in {time_desc})."
+        )
 
-async def _delayed_dispatch(ctx: Any, tool_name: str, args: dict[str, Any], delay_seconds: int) -> None:
-    try:
-        await asyncio.sleep(delay_seconds)
-        await ctx.tool_registry.execute_tool(tool_name, args)
-    except Exception:
-        logger.exception("[SCHEDULER] Scheduled dispatch failed")
-
-
+        return (
+            f"Success: Scheduled. Job ID: {job.task_id}. "
+            f"Will run in {time_desc} (at {future_time.strftime('%H:%M:%S UTC')})."
+        )
 

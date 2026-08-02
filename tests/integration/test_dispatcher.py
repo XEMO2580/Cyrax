@@ -78,6 +78,22 @@ def mock_ctx() -> Mock:
     ctx.interrupt_controller = Mock(name="InterruptController")
     ctx.interrupt_controller.cancel_all.return_value = []
 
+    # ── Phase 7.3: LearningRouter + routing-history persistence mocks ──
+    # _llm_pipeline() awaits select_provider() and record_routing_outcome(),
+    # so both must be AsyncMocks. select_provider returns a (provider,
+    # explanation) tuple — mirroring the real LearningRouter contract.
+    ctx.learning_router = Mock(name="LearningRouter")
+    ctx.learning_router.select_provider = AsyncMock(
+        return_value=(
+            "groq",
+            "[LEARNING_ROUTER] t | COLD START — deferring to DecisionEngine "
+            "recommendation: 'groq'.",
+        )
+    )
+
+    ctx.job_store = Mock(name="JobStore")
+    ctx.job_store.record_routing_outcome = AsyncMock()
+
     return ctx
 
 

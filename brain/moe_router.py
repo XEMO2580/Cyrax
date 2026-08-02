@@ -271,16 +271,18 @@ class MoERouter:
 
     def __init__(
         self,
-        providers:       dict[str, BaseProvider],
-        metrics_manager: ProviderMetricsManager,
+        providers:         dict[str, BaseProvider],
+        metrics_manager:    ProviderMetricsManager,
+        resource_manager:   Any,  # core.resource_manager.ResourceManager
     ) -> None:
         if not providers:
             raise ValueError(
                 "MoERouter requires at least one provider. "
                 "Received empty providers dict."
             )
-        self._providers = providers
-        self._metrics   = metrics_manager
+        self._providers        = providers
+        self._metrics          = metrics_manager
+        self._resource_manager = resource_manager
         logger.info(
             f"[MOE_ROUTER] Initialised. "
             f"Providers: {list(providers.keys())} | "
@@ -406,72 +408,68 @@ class MoERouter:
                 )
                 continue
 
+            semaphore = self._resource_manager.get_provider_semaphore(candidate_name)
             start = time.monotonic()
 
-            try:
-                response = await provider.generate(
-                    messages=messages,
-                    system_prompt=system_prompt,
-                    max_tokens=800,
-                    temperature=0.7,
-                )
-                latency_ms = (time.monotonic() - start) * 1000
-
-                self._metrics.record_event(ProviderExecutionEvent(
-                    provider=candidate_name,
-                    intent=intent,
-                    latency_ms=latency_ms,
-                    success=True,
-                    status_code=200,
-                ))
-
-                if index > 0:
-                    logger.info(
-                        f"[{trace_id}] MOE_ROUTER | "
-                        f"Failover recovery succeeded via '{candidate_name}' "
-                        f"after {index} prior failure(s)."
+            async with semaphore:
+                try:
+                    response = await provider.generate(
+                        messages=messages,
+                        system_prompt=system_prompt,
+                        max_tokens=800,
+                        temperature=0.7,
                     )
-                return _sanitize_output(response)
+                    latency_ms = (time.monotonic() - start) * 1000
 
-            except ProviderError as exc:
-                latency_ms = (time.monotonic() - start) * 1000
-                last_error = exc
+                    self._metrics.record_event(ProviderExecutionEvent(
+                        provider=candidate_name, intent=intent, latency_ms=latency_ms,
+                        success=True, status_code=200,
+                    ))
 
-                self._metrics.record_event(ProviderExecutionEvent(
-                    provider=candidate_name,
-                    intent=intent,
-                    latency_ms=latency_ms,
-                    success=False,
-                    status_code=exc.status_code,
-                ))
+                    if index > 0:
+                        logger.info(
+                            f"[{trace_id}] MOE_ROUTER | "
+                            f"Failover recovery succeeded via '{candidate_name}' "
+                            f"after {index} prior failure(s)."
+                        )
+                    return _sanitize_output(response)
 
-                if not exc.retryable:
-                    logger.error(
-                        f"[{trace_id}] MOE_ROUTER | "
-                        f"Non-retryable error from '{candidate_name}' "
-                        f"(status={exc.status_code}): {exc}. Hard stop — no failover."
-                    )
-                    return (
-                        f"I couldn't complete that request due to a configuration "
-                        f"issue with the '{candidate_name}' provider ({exc})."
-                    )
+                except ProviderError as exc:
+                    latency_ms = (time.monotonic() - start) * 1000
+                    last_error = exc
 
-                next_candidate = candidates[index + 1] if index + 1 < len(candidates) else None
+                    self._metrics.record_event(ProviderExecutionEvent(
+                        provider=candidate_name, intent=intent, latency_ms=latency_ms,
+                        success=False, status_code=exc.status_code,
+                    ))
 
-                if next_candidate:
-                    logger.warning(
-                        f"[FAILOVER] [{trace_id}] "
-                        f"Provider '{candidate_name}' failed "
-                        f"(status={exc.status_code}, retryable=True): {exc}. "
-                        f"Switching to '{next_candidate}'."
-                    )
-                else:
-                    logger.error(
-                        f"[FAILOVER] [{trace_id}] "
-                        f"Provider '{candidate_name}' failed "
-                        f"(status={exc.status_code}, retryable=True): {exc}. "
-                        f"No further providers available — failover chain exhausted."
-                    )
+                    if not exc.retryable:
+                        logger.error(
+                            f"[{trace_id}] MOE_ROUTER | "
+                            f"Non-retryable error from '{candidate_name}' "
+                            f"(status={exc.status_code}): {exc}. Hard stop — no failover."
+                        )
+                        return (
+                            f"I couldn't complete that request due to a configuration "
+                            f"issue with the '{candidate_name}' provider ({exc})."
+                        )
+
+                    next_candidate = candidates[index + 1] if index + 1 < len(candidates) else None
+
+                    if next_candidate:
+                        logger.warning(
+                            f"[FAILOVER] [{trace_id}] "
+                            f"Provider '{candidate_name}' failed "
+                            f"(status={exc.status_code}, retryable=True): {exc}. "
+                            f"Switching to '{next_candidate}'."
+                        )
+                    else:
+                        logger.error(
+                            f"[FAILOVER] [{trace_id}] "
+                            f"Provider '{candidate_name}' failed "
+                            f"(status={exc.status_code}, retryable=True): {exc}. "
+                            f"No further providers available — failover chain exhausted."
+                        )
 
         logger.error(
             f"[{trace_id}] MOE_ROUTER | "
@@ -525,74 +523,70 @@ class MoERouter:
                 )
                 continue
 
+            semaphore = self._resource_manager.get_provider_semaphore(candidate_name)
             start = time.monotonic()
 
-            try:
-                response = await provider.generate(
-                    messages=messages,
-                    system_prompt=system_prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    json_mode=json_mode and provider.capabilities.supports_json_mode,
-                )
-                latency_ms = (time.monotonic() - start) * 1000
-
-                self._metrics.record_event(ProviderExecutionEvent(
-                    provider=candidate_name,
-                    intent=intent,
-                    latency_ms=latency_ms,
-                    success=True,
-                    status_code=200,
-                ))
-
-                if index > 0:
-                    logger.info(
-                        f"[{trace_id}] MOE_ROUTER | "
-                        f"generate() failover recovery succeeded via "
-                        f"'{candidate_name}' after {index} prior failure(s)."
+            async with semaphore:
+                try:
+                    response = await provider.generate(
+                        messages=messages,
+                        system_prompt=system_prompt,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        json_mode=json_mode and provider.capabilities.supports_json_mode,
                     )
-                return response
+                    latency_ms = (time.monotonic() - start) * 1000
 
-            except ProviderError as exc:
-                latency_ms = (time.monotonic() - start) * 1000
-                last_error = exc
+                    self._metrics.record_event(ProviderExecutionEvent(
+                        provider=candidate_name, intent=intent, latency_ms=latency_ms,
+                        success=True, status_code=200,
+                    ))
 
-                self._metrics.record_event(ProviderExecutionEvent(
-                    provider=candidate_name,
-                    intent=intent,
-                    latency_ms=latency_ms,
-                    success=False,
-                    status_code=exc.status_code,
-                ))
+                    if index > 0:
+                        logger.info(
+                            f"[{trace_id}] MOE_ROUTER | "
+                            f"generate() failover recovery succeeded via "
+                            f"'{candidate_name}' after {index} prior failure(s)."
+                        )
+                    return response
 
-                if not exc.retryable:
-                    logger.error(
-                        f"[{trace_id}] MOE_ROUTER | "
-                        f"generate(): non-retryable error from '{candidate_name}' "
-                        f"(status={exc.status_code}): {exc}. Hard stop — no failover."
-                    )
-                    return (
-                        f'{{"thought": "Provider error", "action": null, '
-                        f'"action_args": {{}}, "final_answer": '
-                        f'"I hit a configuration issue with the \'{candidate_name}\' provider and cannot continue."}}'
-                    )
+                except ProviderError as exc:
+                    latency_ms = (time.monotonic() - start) * 1000
+                    last_error = exc
 
-                next_candidate = candidates[index + 1] if index + 1 < len(candidates) else None
+                    self._metrics.record_event(ProviderExecutionEvent(
+                        provider=candidate_name, intent=intent, latency_ms=latency_ms,
+                        success=False, status_code=exc.status_code,
+                    ))
 
-                if next_candidate:
-                    logger.warning(
-                        f"[FAILOVER] [{trace_id}] "
-                        f"generate(): provider '{candidate_name}' failed "
-                        f"(status={exc.status_code}, retryable=True): {exc}. "
-                        f"Switching to '{next_candidate}'."
-                    )
-                else:
-                    logger.error(
-                        f"[FAILOVER] [{trace_id}] "
-                        f"generate(): provider '{candidate_name}' failed "
-                        f"(status={exc.status_code}, retryable=True): {exc}. "
-                        f"No further providers available — failover chain exhausted."
-                    )
+                    if not exc.retryable:
+                        logger.error(
+                            f"[{trace_id}] MOE_ROUTER | "
+                            f"generate(): non-retryable error from '{candidate_name}' "
+                            f"(status={exc.status_code}): {exc}. Hard stop — no failover."
+                        )
+                        return (
+                            f'{{"thought": "Provider error", "action": null, '
+                            f'"action_args": {{}}, "final_answer": '
+                            f'"I hit a configuration issue with the \'{candidate_name}\' provider and cannot continue."}}'
+                        )
+
+                    next_candidate = candidates[index + 1] if index + 1 < len(candidates) else None
+
+                    if next_candidate:
+                        logger.warning(
+                            f"[FAILOVER] [{trace_id}] "
+                            f"generate(): provider '{candidate_name}' failed "
+                            f"(status={exc.status_code}, retryable=True): {exc}. "
+                            f"Switching to '{next_candidate}'."
+                        )
+                    else:
+                        logger.error(
+                            f"[FAILOVER] [{trace_id}] "
+                            f"generate(): provider '{candidate_name}' failed "
+                            f"(status={exc.status_code}, retryable=True): {exc}. "
+                            f"No further providers available — failover chain exhausted."
+                        )
 
         logger.error(
             f"[{trace_id}] MOE_ROUTER | "

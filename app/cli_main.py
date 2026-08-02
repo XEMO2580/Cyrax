@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from app.bootstrap import bootstrap
+from core.job_scheduler import JobScheduler
 from core.notification_center import TaskNotificationEvent
 from logging_.event_logger import get_logger
 from config.settings import settings
@@ -200,6 +201,27 @@ async def main() -> None:
     logger = get_logger()
     logger.info(f"System boot sequence initiated in {mode.upper()} mode.")
 
+# ── Phase 8.5: Initialise SQLite job store ─────────────────────────────
+    await ctx.job_store.init()
+    logger.info("SQLite job store initialised.")
+
+    # ── Phase 8.5: Recover crashed jobs ────────────────────────────────────
+    recovered_jobs = await ctx.job_store.recover_pending_jobs()
+    for job in recovered_jobs:
+        await ctx.task_queue.push_recovered_job(job)
+    if recovered_jobs:
+        logger.info(f"Recovered {len(recovered_jobs)} pending job(s) from crash.")
+    else:
+        logger.info("No pending jobs to recover.")
+
+    # ── Phase 8.5: Inject and start JobScheduler ───────────────────────────
+    # ctx is frozen, so we use object.__setattr__ to inject the scheduler
+    # (since JobScheduler needs ctx, creating a circular dependency at
+    # construction time).
+    object.__setattr__(ctx, 'job_scheduler', JobScheduler(ctx))
+    await ctx.job_scheduler.start()
+    logger.info("JobScheduler started.")
+
     # ── Phase 8.2: Background Task Executor ─────────────────────────────────
     executor = TaskExecutor(ctx)
     await executor.start()
@@ -248,6 +270,13 @@ async def main() -> None:
     for task, result in zip([sensor_task, brain_task], results):
         if isinstance(result, Exception):
             logger.error(f"TASK_CRASH in {task.get_name()}: {result}")
+
+# ── Phase 8.5: Stop JobScheduler and close job store ───────────────────
+    if ctx.job_scheduler is not None:
+        await ctx.job_scheduler.stop()
+        logger.info("JobScheduler stopped.")
+    await ctx.job_store.close()
+    logger.info("SQLite job store closed.")
 
     # ── Phase 8.3: Unsubscribe notification listener ────────────────────────
     await ctx.notification_center.unsubscribe(on_task_notification)

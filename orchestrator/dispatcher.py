@@ -6,6 +6,14 @@ Phase 8.3 changes:
     immediate → chat, interactive → Planner).
   - ctx.task_queue.submit() passes tools_required and provider_name directly
     (no more hacky post-submit attribute patching).
+
+Phase 7.3 changes:
+  - _llm_pipeline() now consults ctx.learning_router (LearningRouter) after
+    the Decision Engine, deriving a coarse IntentFamily via
+    _map_intent_to_family() and letting the router optionally override the
+    provider pick. The final provider is used everywhere downstream, and the
+    outcome (success + latency) is recorded back into routing_history via
+    ctx.job_store.record_routing_outcome().
 """
 
 from __future__ import annotations
@@ -13,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 import uuid
 from typing import Any
 
@@ -175,13 +184,27 @@ class Dispatcher:
 
         decision = await ctx.decision_engine.classify(user_text)
 
+        # ── Phase 7.3: LearningRouter refines DecisionEngine's provider pick ──
+        # intent_family is derived from DecisionEngine's finer-grained intent
+        # via a simple mapping — LearningRouter operates on the coarser
+        # 10-family taxonomy, not the full 11-category one.
+        intent_family = _map_intent_to_family(decision.intent)
+
+        final_provider, routing_explanation = await ctx.learning_router.select_provider(
+            intent_family=intent_family,
+            recommended_provider=decision.selected_provider,
+            trace_id=req_id,
+        )
+
         logger.info(
-            f"[{req_id}] DECISION_ENGINE | "
-            f"intent={decision.intent} | "
+            f"[{req_id}] DECISION_ENGINE | intent={decision.intent} | "
             f"tools_required={decision.tools_required} | "
             f"execution_mode={decision.execution_mode.value} | "
-            f"provider={decision.selected_provider}"
+            f"de_provider={decision.selected_provider} | "
+            f"lr_final_provider={final_provider}"
         )
+
+        start_time = time.monotonic()
 
         # ── Background: queue and return immediately ─────────────────────────
         if decision.execution_mode.value == "background":
@@ -191,7 +214,7 @@ class Dispatcher:
                 user_input=user_text,
                 task_type=TaskType.BACKGROUND,
                 tools_required=decision.tools_required,
-                provider_name=decision.selected_provider,
+                provider_name=final_provider,
             )
 
             logger.info(
@@ -209,26 +232,47 @@ class Dispatcher:
 
         # ── Immediate: direct chat, no tools ──────────────────────────────────
         if not decision.tools_required:
-            logger.debug(f"[{req_id}] CHAT_DIRECT | provider={decision.selected_provider}")
-            response = await ctx.brain_router.chat(
-                user_input=user_text,
-                history=history,
-                trace_id=req_id,
-                provider_name=decision.selected_provider,
+            logger.debug(f"[{req_id}] CHAT_DIRECT | provider={final_provider}")
+            try:
+                response = await ctx.brain_router.chat(
+                    user_input=user_text,
+                    history=history,
+                    trace_id=req_id,
+                    provider_name=final_provider,
+                )
+                succeeded = True
+            except Exception:
+                response = ""
+                succeeded = False
+
+            latency_ms = (time.monotonic() - start_time) * 1000
+            await ctx.job_store.record_routing_outcome(
+                intent_family=intent_family, provider=final_provider,
+                success=succeeded, latency_ms=latency_ms, fallback_used=False,
+                reason=decision.reason,
             )
+
             response = self._sanitize_output(response)
             await ctx.memory.conversation.add_interaction("user", user_text)
             await ctx.memory.conversation.add_interaction("assistant", response)
-            return {"status": "success", "response": response}
+            return {"status": "success" if succeeded else "error", "response": response}
 
         # ── Interactive: Planner, forced provider, synchronous ────────────────
         logger.info(
             f"[{req_id}] PLANNER_DELEGATE | "
-            f"provider={decision.selected_provider} (forced by Decision Engine)"
+            f"provider={final_provider} (forced by Decision Engine)"
         )
 
-        planner = Planner(ctx=ctx, req_id=req_id, provider_name=decision.selected_provider)
+        planner = Planner(ctx=ctx, req_id=req_id, provider_name=final_provider)
         result = await planner.run(user_input=user_text, history=history)
+
+        latency_ms = (time.monotonic() - start_time) * 1000
+        await ctx.job_store.record_routing_outcome(
+            intent_family=intent_family, provider=final_provider,
+            success=(result.get("status") == "success"),
+            latency_ms=latency_ms, fallback_used=False,
+            reason=decision.reason,
+        )
 
         response_text = self._sanitize_output(result.get("response", ""))
         await ctx.memory.conversation.add_interaction("user", user_text)
@@ -260,3 +304,29 @@ class Dispatcher:
         if len(cleaned) > 1500:
             cleaned = cleaned[:1500] + "\n... [Response truncated]"
         return cleaned
+
+
+# ── Phase 7.3: IntentCategory → IntentFamily mapping ─────────────────────────
+
+def _map_intent_to_family(intent: str) -> str:
+    """
+    Maps DecisionEngine's 11-category IntentCategory onto LearningRouter's
+    10-value IntentFamily. Most map 1:1 by name; the DecisionEngine
+    categories with no direct IntentFamily analog (LIVE_INFORMATION,
+    AUTOMATION, UNKNOWN, CONTENT_WRITING) are folded into the nearest
+    adjacent family so LearningRouter always has a bucket to score against.
+    """
+    mapping = {
+        "OS_CONTROL":       "OS_CONTROL",
+        "FILE_OPERATION":   "FILE_OPERATIONS",
+        "WEB_RESEARCH":     "WEB_RESEARCH",
+        "LIVE_INFORMATION": "WEB_RESEARCH",
+        "CODE_GENERATION":  "CODE_GENERATION",
+        "CONTENT_WRITING":  "REASONING",
+        "GENERAL_CHAT":     "GENERAL_CHAT",
+        "REASONING":        "REASONING",
+        "MEMORY":           "MEMORY",
+        "AUTOMATION":       "SYSTEM",
+        "UNKNOWN":          "GENERAL_CHAT",
+    }
+    return mapping.get(intent, "GENERAL_CHAT")

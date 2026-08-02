@@ -66,12 +66,15 @@ class BaseTool(ABC):
     @abstractmethod
     def execute(self, **kwargs) -> str:
         """
-        Synchronous execution body.
+        Execution body.
 
+        May be implemented as a synchronous method or an `async def`.
         Returns a plain string result on success.
         Returns a string starting with "Error:" on failure.
         Never raises — catch all exceptions internally and return an error string.
-        The registry wraps this in asyncio.to_thread(); do not add async here.
+        The registry detects coroutine functions (asyncio.iscoroutinefunction)
+        and awaits them directly on the event loop; synchronous tools run
+        via asyncio.to_thread().
         """
         ...
 
@@ -303,17 +306,27 @@ class ToolRegistry:
                 ),
             }
 
-        # ── 5. Threaded Execution with Timeout ────────────────────────────────
+        # ── 5. Execution with Timeout ────────────────────────────────────────
         logger.info(
             f"[REGISTRY] Executing: {tool_name} | "
             f"args={validated.model_dump()}"
         )
 
         try:
-            raw_result: str = await asyncio.wait_for(
-                asyncio.to_thread(tool.execute, **validated.model_dump()),
-                timeout=settings.TOOL_TIMEOUT_SECONDS,
-            )
+            if asyncio.iscoroutinefunction(tool.execute):
+                # Async tools (e.g. SCHEDULE_TASK) run directly on the event
+                # loop — no threading bridge required.
+                raw_result: str = await asyncio.wait_for(
+                    tool.execute(**validated.model_dump()),
+                    timeout=settings.TOOL_TIMEOUT_SECONDS,
+                )
+            else:
+                # Sync tools run on a worker thread so blocking I/O never
+                # stalls the event loop.
+                raw_result = await asyncio.wait_for(
+                    asyncio.to_thread(tool.execute, **validated.model_dump()),
+                    timeout=settings.TOOL_TIMEOUT_SECONDS,
+                )
 
             result_str = str(raw_result).strip()
 

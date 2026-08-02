@@ -17,6 +17,11 @@ Phase 4 changes (unchanged from prior version):
   - UserProfileStore registered in MemoryStack in place of the old stub.
   - CoreMemoryWriteTool and CoreMemoryReadTool registered in the tool registry.
   - _EXPECTED_TOOL_COUNT = 7.
+
+Phase 8.5 changes:
+  - Added SQLiteJobStore setup (Step 9a).
+  - TaskQueue now requires job_store argument.
+  - job_store passed to CyraxContext.
 """
 
 from __future__ import annotations
@@ -48,7 +53,9 @@ from core.context import (
     FallbackPolicyProtocol,
 )
 from core.interrupt_controller import InterruptController
+from core.job_store import SQLiteJobStore
 from core.notification_center import NotificationCenter
+from core.resource_manager import ResourceManager
 from core.task_queue import TaskQueue
 from core.trace import new_trace_id
 
@@ -69,6 +76,7 @@ from memory.profile.profile_store import UserProfileStore   # Patched: synchrono
 
 # ── Brain ─────────────────────────────────────────────────────────────────────
 from brain.providers.base import BaseProvider, ProviderCapabilities, ProviderError
+from brain.learning_router import LearningRouter
 from brain.moe_router import MoERouter
 from brain.provider_metrics import ProviderMetricsManager
 from brain.provider_selector import ProviderSelector
@@ -118,7 +126,7 @@ class MemoryStack:
 # EXPECTED TOOL COUNT
 # ══════════════════════════════════════════════════════════════════════════════
 
-_EXPECTED_TOOL_COUNT: int = 21  # Update this if you add/remove tools in the registry above.
+_EXPECTED_TOOL_COUNT: int = 23  # Update this if you add/remove tools in the registry above.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -189,6 +197,7 @@ def bootstrap() -> CyraxContext:
         from tools.web_reader import ReadWebpageTool
         from tools.scheduler import ScheduleTaskTool
         from tools.memory_ops import CoreMemoryWriteTool, CoreMemoryReadTool
+        from tools.email_ops import SendEmailTool, ReadEmailTool
 
         registry.register(OpenAppTool())
         registry.register(CloseAppTool())
@@ -211,6 +220,8 @@ def bootstrap() -> CyraxContext:
         registry.register(ScheduleTaskTool())
         registry.register(CoreMemoryWriteTool())
         registry.register(CoreMemoryReadTool())
+        registry.register(SendEmailTool())
+        registry.register(ReadEmailTool())
 
         registry._lock()
 
@@ -274,6 +285,15 @@ def bootstrap() -> CyraxContext:
         f"LLM providers: {list(providers.keys())} registered. ✓"
     )
 
+    # ── Step 6a: Resource manager ─────────────────────────────────────────────
+    stdlib_logger.info("Step 6a/10 — Resource manager...")
+    try:
+        resource_manager = ResourceManager()
+    except Exception as exc:
+        _hard_fail(f"ResourceManager initialisation failed: {exc}")
+
+    stdlib_logger.info("Resource manager: OK ✓")
+
     # ── Step 7: Brain router ──────────────────────────────────────────────────
     stdlib_logger.info("Step 7/10 — Brain router (MoERouter)...")
     try:
@@ -281,6 +301,7 @@ def bootstrap() -> CyraxContext:
         brain_router = MoERouter(
             providers=providers,
             metrics_manager=metrics_manager,
+            resource_manager=resource_manager,
         )
     except Exception as exc:
         _hard_fail(f"MoERouter initialisation failed: {exc}")
@@ -324,17 +345,26 @@ def bootstrap() -> CyraxContext:
 
     stdlib_logger.info("Dispatcher: OK ✓")
 
-    # ── Step 9a: Task queue ──────────────────────────────────────────────────
-    stdlib_logger.info("Step 9a/10 — Task queue...")
+    # ── Step 9a: SQLite Job Store ──────────────────────────────────────────
+    stdlib_logger.info("Step 9a/10 — SQLite job store...")
     try:
-        task_queue = TaskQueue()
+        job_store = SQLiteJobStore()
+    except Exception as exc:
+        _hard_fail(f"SQLiteJobStore initialisation failed: {exc}")
+
+    stdlib_logger.info("SQLite job store: OK ✓")
+
+    # ── Step 9b: Task queue ──────────────────────────────────────────────────
+    stdlib_logger.info("Step 9b/10 — Task queue...")
+    try:
+        task_queue = TaskQueue(job_store=job_store)
     except Exception as exc:
         _hard_fail(f"TaskQueue initialisation failed: {exc}")
 
     stdlib_logger.info("Task queue: OK ✓")
 
-    # ── Step 9b: Notification Center ─────────────────────────────────────────
-    stdlib_logger.info("Step 9b/10 — Notification Center...")
+    # ── Step 9c: Notification Center ─────────────────────────────────────────
+    stdlib_logger.info("Step 9c/10 — Notification Center...")
     try:
         notification_center = NotificationCenter()
     except Exception as exc:
@@ -342,14 +372,23 @@ def bootstrap() -> CyraxContext:
 
     stdlib_logger.info("Notification center: OK ✓")
 
-    # ── Step 9c: Interrupt Controller ────────────────────────────────────────
-    stdlib_logger.info("Step 9c/10 — Interrupt Controller...")
+    # ── Step 9d: Interrupt Controller ────────────────────────────────────────
+    stdlib_logger.info("Step 9d/10 — Interrupt Controller...")
     try:
         interrupt_controller = InterruptController()
     except Exception as exc:
         _hard_fail(f"InterruptController initialisation failed: {exc}")
 
     stdlib_logger.info("Interrupt controller: OK ✓")
+
+    # ── Step 9e: Learning Router ──────────────────────────────────────────────
+    stdlib_logger.info("Step 9e/10 — Learning Router...")
+    try:
+        learning_router = LearningRouter(job_store=job_store)
+    except Exception as exc:
+        _hard_fail(f"LearningRouter initialisation failed: {exc}")
+
+    stdlib_logger.info("Learning router: OK ✓")
 
     # ── Step 10: Assemble CyraxContext ────────────────────────────────────────
     stdlib_logger.info("Step 10/10 — Assembling CyraxContext...")
@@ -366,6 +405,9 @@ def bootstrap() -> CyraxContext:
             task_queue            = task_queue,
             notification_center   = notification_center,
             interrupt_controller  = interrupt_controller,
+            job_store             = job_store,
+            resource_manager      = resource_manager,
+            learning_router       = learning_router,
         )
     except (TypeError, ValueError) as exc:
         _hard_fail(

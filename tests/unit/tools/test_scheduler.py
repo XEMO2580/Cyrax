@@ -1,32 +1,31 @@
 """
-tests/tools/test_scheduler.py — Certification suite for tools/scheduler.py
+tests/unit/tools/test_scheduler.py — Certification suite for tools/scheduler.py
 
-TECHNIQUE NOTE (see Phase 4.5A audit, explicitly flagged by task directive):
-  1. self._loop must be a REAL running event loop — call_soon_threadsafe
-     requires a genuine asyncio.AbstractEventLoop, not a Mock.
-  2. asyncio.sleep inside _delayed_dispatch is patched so scheduled tasks
-     fire immediately and deterministically — otherwise tests would
-     genuinely wait out delay_seconds (up to 3600s per the schema ceiling),
-     hanging the suite.
+Phase 8.5 refactor: execute() is now async and runs directly on the event
+loop via ToolRegistry's async-tool path. There is no _loop injection, no
+asyncio.run_coroutine_threadsafe, and no tool_name/args in the schema —
+the tool classifies the natural-language request through the Decision
+Engine BEFORE writing the SCHEDULED job to the job store.
 
-Tests call tool.execute() via asyncio.to_thread() (mirroring
-ToolRegistry.execute_tool()'s real threading behaviour), then await a
-short synchronization window to let the scheduled coroutine actually run
-on the test's event loop before asserting on its side effects.
+Tests:
+  - Classification runs BEFORE the job is saved (ordering contract).
+  - tools_required / provider_name are persisted from the decision so the
+    background TaskExecutor routes to the Planner (not chat) when needed.
+  - Missing ctx returns a graceful Error string, never raises.
+  - DB failure returns a graceful Error string, never raises.
+  - Schema validation (delay bounds) is unchanged.
 """
 
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from pydantic import ValidationError
 
-from security.auth import SecurityLevel
 from tools.scheduler import (
     ScheduleTaskTool, ScheduleTaskSchema,
-    _MAX_DELAY_SECONDS, _MAX_ARGS_STR_LEN,
+    _MAX_DELAY_SECONDS,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -38,38 +37,21 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.fixture
 def mock_ctx() -> Mock:
+    """CyraxContext double with async decision_engine and job_store."""
     ctx = Mock(name="CyraxContext")
-    ctx.tool_registry = Mock(name="ToolRegistry")
-    ctx.tool_registry.get_tool_names.return_value = [
-        "WEB_SEARCH", "SEND_NOTIFICATION", "OPEN_APP", "SYSTEM_POWER",
-    ]
 
-    def _metadata(tool_name: str):
-        levels = {
-            "WEB_SEARCH":        SecurityLevel.USER,
-            "SEND_NOTIFICATION": SecurityLevel.UNRESTRICTED,
-            "OPEN_APP":          SecurityLevel.UNRESTRICTED,
-            "SYSTEM_POWER":      SecurityLevel.ADMIN,
-        }
-        if tool_name not in levels:
-            return None
-        return {"name": tool_name, "security_level": levels[tool_name]}
-
-    ctx.tool_registry.get_tool_metadata.side_effect = _metadata
-    ctx.tool_registry.execute_tool = AsyncMock(
-        return_value={"status": "success", "response": "Done."}
+    ctx.decision_engine = Mock(name="DecisionEngine")
+    ctx.decision_engine.classify = AsyncMock(
+        return_value=Mock(
+            tools_required=True,
+            selected_provider="groq",
+        )
     )
+
+    ctx.job_store = Mock(name="SQLiteJobStore")
+    ctx.job_store.insert_job = AsyncMock()
+
     return ctx
-
-
-async def _run_schedule_execute(tool, ctx, loop, **kwargs) -> str:
-    """Runs execute() on a worker thread with self._ctx/self._loop injected."""
-    tool._ctx  = ctx
-    tool._loop = loop
-    return await asyncio.wait_for(
-        asyncio.to_thread(tool.execute, **kwargs),
-        timeout=5.0,
-    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -78,162 +60,108 @@ async def _run_schedule_execute(tool, ctx, loop, **kwargs) -> str:
 
 class TestScheduleTaskTool:
 
-    async def test_happy_path_immediate_dispatch(self, mock_ctx: Mock) -> None:
-        """
-        Deterministic scheduling test: asyncio.sleep is patched to a no-op
-        so the delayed task fires as soon as it's scheduled, without the
-        test actually waiting delay_seconds in real time.
-        """
-        loop = asyncio.get_running_loop()
+    async def test_happy_path_schedules_job(self, mock_ctx: Mock) -> None:
+        """A valid request is classified, saved as SCHEDULED, and acknowledged."""
+        tool = ScheduleTaskTool()
+        tool._ctx = mock_ctx
 
-        with patch("tools.scheduler.asyncio.sleep", AsyncMock(return_value=None)):
-            result = await _run_schedule_execute(
-                ScheduleTaskTool(), mock_ctx, loop,
-                tool_name="WEB_SEARCH", args={"query": "test"}, delay_seconds=10,
-            )
-            # Give the event loop one cycle to run the posted coroutine.
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)  # second yield — ensure_future scheduling settles
-
-        assert result.startswith("Success:")
-        assert "WEB_SEARCH" in result
-        mock_ctx.tool_registry.execute_tool.assert_awaited_once_with(
-            "WEB_SEARCH", {"query": "test"}
+        result = await tool.execute(
+            user_input="search the web for RTX 5090 price", delay_seconds=10,
         )
+
+        assert result.startswith("Success: Scheduled.")
+        assert "Job ID:" in result
+        assert "10s" in result
+
+        mock_ctx.decision_engine.classify.assert_awaited_once_with(
+            "search the web for RTX 5090 price"
+        )
+        mock_ctx.job_store.insert_job.assert_awaited_once()
+
+        saved_job = mock_ctx.job_store.insert_job.await_args.args[0]
+        assert saved_job.user_input == "search the web for RTX 5090 price"
+        assert saved_job.tools_required is True
+        assert saved_job.provider_name == "groq"
+        assert saved_job.scheduled_at is not None
+
+    async def test_classification_happens_before_save(self, mock_ctx: Mock) -> None:
+        """
+        Ordering contract: classify() must be fully awaited before
+        insert_job() is ever called — the persisted routing metadata
+        comes from that classification.
+        """
+        call_log: list[str] = []
+
+        async def _classify(user_input: str):
+            call_log.append("classify")
+            return Mock(tools_required=False, selected_provider="groq")
+
+        async def _insert_job(job) -> None:
+            call_log.append("insert")
+            assert call_log.count("classify") >= 1
+
+        mock_ctx.decision_engine.classify = AsyncMock(side_effect=_classify)
+        mock_ctx.job_store.insert_job = AsyncMock(side_effect=_insert_job)
+
+        tool = ScheduleTaskTool()
+        tool._ctx = mock_ctx
+
+        await tool.execute(user_input="hello", delay_seconds=5)
+
+        assert call_log == ["classify", "insert"]
+
+    async def test_routing_metadata_persisted_from_decision(
+        self, mock_ctx: Mock
+    ) -> None:
+        """tools_required / provider_name must come from the decision engine."""
+        mock_ctx.decision_engine.classify = AsyncMock(
+            return_value=Mock(tools_required=False, selected_provider="gemini")
+        )
+
+        tool = ScheduleTaskTool()
+        tool._ctx = mock_ctx
+
+        await tool.execute(user_input="tell me a joke", delay_seconds=5)
+
+        saved_job = mock_ctx.job_store.insert_job.await_args.args[0]
+        assert saved_job.tools_required is False
+        assert saved_job.provider_name == "gemini"
+
+    async def test_missing_context_dependency(self) -> None:
+        """No ctx injected — graceful Error string, not an AttributeError."""
+        tool = ScheduleTaskTool()
+
+        result = await tool.execute(user_input="do something", delay_seconds=5)
+
+        assert result.startswith("Error:")
+        assert "CyraxContext" in result
+
+    async def test_db_failure_returns_error_string(self, mock_ctx: Mock) -> None:
+        """A job-store failure is caught and surfaced, never raised."""
+        mock_ctx.job_store.insert_job = AsyncMock(
+            side_effect=RuntimeError("disk full")
+        )
+
+        tool = ScheduleTaskTool()
+        tool._ctx = mock_ctx
+
+        result = await tool.execute(user_input="do something", delay_seconds=5)
+
+        assert result.startswith("Error:")
+        assert "Could not schedule task" in result
+        assert "disk full" in result
 
     def test_invalid_args_delay_too_large(self) -> None:
         with pytest.raises(ValidationError):
             ScheduleTaskSchema(
-                tool_name="WEB_SEARCH", args={}, delay_seconds=_MAX_DELAY_SECONDS + 1
+                user_input="do something", delay_seconds=_MAX_DELAY_SECONDS + 1
             )
 
     def test_invalid_args_delay_zero(self) -> None:
         with pytest.raises(ValidationError):
-            ScheduleTaskSchema(tool_name="WEB_SEARCH", args={}, delay_seconds=0)
+            ScheduleTaskSchema(user_input="do something", delay_seconds=0)
 
-    async def test_missing_context_dependency(self) -> None:
-        tool = ScheduleTaskTool()
-        result = await asyncio.to_thread(
-            tool.execute, tool_name="WEB_SEARCH", args={}, delay_seconds=5
-        )
-        assert result.startswith("Error:")
-        assert "CyraxContext" in result
+    def test_invalid_args_missing_user_input(self) -> None:
+        with pytest.raises(ValidationError):
+            ScheduleTaskSchema(delay_seconds=5)
 
-    async def test_missing_loop_dependency(self, mock_ctx: Mock) -> None:
-        tool = ScheduleTaskTool()
-        tool._ctx = mock_ctx
-        # _loop deliberately NOT set.
-        result = await asyncio.to_thread(
-            tool.execute, tool_name="WEB_SEARCH", args={}, delay_seconds=5
-        )
-        assert result.startswith("Error:")
-        assert "event loop" in result.lower()
-
-    async def test_malicious_input_admin_tool_hard_rejected(self, mock_ctx: Mock) -> None:
-        """
-        CRITICAL security regression test: scheduling an ADMIN-level tool
-        (SYSTEM_POWER) must be hard-rejected at schedule time, per the
-        Phase 3 patch fixing auth-blackholing. Must NOT reach call_soon_threadsafe.
-        """
-        loop = asyncio.get_running_loop()
-        mock_loop = Mock(wraps=loop)  # wrap real loop, spy on call_soon_threadsafe
-        mock_loop.is_running.return_value = True
-
-        result = await _run_schedule_execute(
-            ScheduleTaskTool(), mock_ctx, mock_loop,
-            tool_name="SYSTEM_POWER", args={"action": "shutdown"}, delay_seconds=5,
-        )
-
-        assert result.startswith("Error:")
-        assert "ADMIN-level tools cannot be scheduled" in result
-        mock_loop.call_soon_threadsafe.assert_not_called()
-        mock_ctx.tool_registry.execute_tool.assert_not_awaited()
-
-    async def test_unregistered_tool_rejected(self, mock_ctx: Mock) -> None:
-        loop = asyncio.get_running_loop()
-        result = await _run_schedule_execute(
-            ScheduleTaskTool(), mock_ctx, loop,
-            tool_name="NONEXISTENT_TOOL", args={}, delay_seconds=5,
-        )
-
-        assert result.startswith("Error:")
-        assert "not registered" in result.lower()
-
-    async def test_empty_args_dict_accepted(self, mock_ctx: Mock) -> None:
-        loop = asyncio.get_running_loop()
-        with patch("tools.scheduler.asyncio.sleep", AsyncMock(return_value=None)):
-            result = await _run_schedule_execute(
-                ScheduleTaskTool(), mock_ctx, loop,
-                tool_name="SEND_NOTIFICATION", args={}, delay_seconds=1,
-            )
-            await asyncio.sleep(0)
-
-        assert result.startswith("Success:")
-
-    async def test_large_args_payload_rejected(self, mock_ctx: Mock) -> None:
-        loop = asyncio.get_running_loop()
-        oversized_args = {"query": "x" * _MAX_ARGS_STR_LEN}
-
-        result = await _run_schedule_execute(
-            ScheduleTaskTool(), mock_ctx, loop,
-            tool_name="WEB_SEARCH", args=oversized_args, delay_seconds=5,
-        )
-
-        assert result.startswith("Error:")
-        assert "too large" in result.lower()
-        mock_ctx.tool_registry.execute_tool.assert_not_awaited()
-
-    async def test_non_serialisable_args_rejected(self, mock_ctx: Mock) -> None:
-        loop = asyncio.get_running_loop()
-
-        class Unserialisable:
-            pass
-
-        result = await _run_schedule_execute(
-            ScheduleTaskTool(), mock_ctx, loop,
-            tool_name="WEB_SEARCH", args={"bad": Unserialisable()}, delay_seconds=5,
-        )
-
-        assert result.startswith("Error:")
-        assert "json-serialisable" in result.lower()
-
-    async def test_loop_not_running_rejected(self, mock_ctx: Mock) -> None:
-        stopped_loop = Mock()
-        stopped_loop.is_running.return_value = False
-
-        tool = ScheduleTaskTool()
-        tool._ctx  = mock_ctx
-        tool._loop = stopped_loop
-
-        result = await asyncio.to_thread(
-            tool.execute, tool_name="WEB_SEARCH", args={}, delay_seconds=5
-        )
-
-        assert result.startswith("Error:")
-        assert "no longer running" in result.lower()
-
-    async def test_delayed_task_failure_does_not_raise_to_scheduler(
-        self, mock_ctx: Mock
-    ) -> None:
-        """
-        If the eventually-executed tool itself fails, _delayed_dispatch
-        must log and swallow it — never propagate an unhandled exception
-        into the event loop's exception handler.
-        """
-        loop = asyncio.get_running_loop()
-        mock_ctx.tool_registry.execute_tool = AsyncMock(
-            side_effect=RuntimeError("downstream tool crashed")
-        )
-
-        with patch("tools.scheduler.asyncio.sleep", AsyncMock(return_value=None)):
-            result = await _run_schedule_execute(
-                ScheduleTaskTool(), mock_ctx, loop,
-                tool_name="WEB_SEARCH", args={"query": "x"}, delay_seconds=1,
-            )
-            # Allow the scheduled coroutine to run and raise internally.
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
-
-        # execute() itself still returns success — the failure happens
-        # later, inside the background coroutine, and is caught there.
-        assert result.startswith("Success:")

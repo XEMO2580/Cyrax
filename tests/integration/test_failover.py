@@ -15,6 +15,7 @@ import pytest
 
 from brain.moe_router import MoERouter
 from brain.providers.base import BaseProvider, ProviderCapabilities, ProviderError
+from core.resource_manager import ResourceManager
 
 pytestmark = pytest.mark.asyncio
 
@@ -51,7 +52,11 @@ class TestMoERouterFailover:
         groq = _make_mock_provider("groq")
         groq.generate.return_value = "Fallback successful"
 
-        router = MoERouter(providers={"gemini": gemini, "groq": groq}, metrics_manager=Mock())
+        router = MoERouter(
+            providers={"gemini": gemini, "groq": groq},
+            metrics_manager=Mock(),
+            resource_manager=ResourceManager(),
+        )
 
         with caplog.at_level("WARNING"):
             result = await router.chat(
@@ -84,7 +89,11 @@ class TestMoERouterFailover:
         groq = _make_mock_provider("groq")
         groq.generate.return_value = "Should never be reached"
 
-        router = MoERouter(providers={"gemini": gemini, "groq": groq}, metrics_manager=Mock())
+        router = MoERouter(
+            providers={"gemini": gemini, "groq": groq},
+            metrics_manager=Mock(),
+            resource_manager=ResourceManager(),
+        )
 
         result = await router.chat(
             user_input="hello",
@@ -114,7 +123,11 @@ class TestMoERouterFailover:
         groq = _make_mock_provider("groq")
         groq.generate.return_value = "Should never be reached"
 
-        router = MoERouter(providers={"gemini": gemini, "groq": groq}, metrics_manager=Mock())
+        router = MoERouter(
+            providers={"gemini": gemini, "groq": groq},
+            metrics_manager=Mock(),
+            resource_manager=ResourceManager(),
+        )
 
         result = await router.chat(
             user_input="hello",
@@ -145,7 +158,11 @@ class TestMoERouterFailover:
             "Service unavailable", provider="groq", status_code=503, retryable=True,
         )
 
-        router = MoERouter(providers={"gemini": gemini, "groq": groq}, metrics_manager=Mock())
+        router = MoERouter(
+            providers={"gemini": gemini, "groq": groq},
+            metrics_manager=Mock(),
+            resource_manager=ResourceManager(),
+        )
 
         result = await router.chat(
             user_input="hello",

@@ -50,6 +50,8 @@ def mock_ctx() -> Mock:
     ctx.security = Mock(name="SecurityGuard")
     ctx.security.authorize_action.return_value = True
 
+    ctx.resource_manager = Mock(name="ResourceManager")
+
     return ctx
 
 
