@@ -103,12 +103,12 @@ class CyraxSettings(BaseSettings):
     )
 
     GROQ_MODEL: str = Field(
-        default="llama-3.3-70b-versatile",
+        default="openai/gpt-oss-120b",
         description="Groq model identifier. Update when Groq deprecates a model.",
     )
 
     GEMINI_MODEL: str = Field(
-        default="gemini-2.0-flash",
+        default="gemini-3.6-flash",
         description="Gemini model identifier.",
     )
 
@@ -152,6 +152,33 @@ class CyraxSettings(BaseSettings):
         description="Max tool-execution steps the planner may take in a single turn.",
     )
 
+    # Planner schema/JSON parsing tuning
+    PLANNER_MAX_SCHEMA_RETRIES: int = Field(
+        default=1,
+        ge=0,
+        le=10,
+        description="Number of correction attempts the planner will ask the LLM to make when JSON schema parsing fails.",
+    )
+
+    PLANNER_SCHEMA_RETRY_BACKOFF_SECONDS: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=10.0,
+        description="Base backoff (seconds) between schema-correction retries; multiplied by attempt number for simple backoff.",
+    )
+
+    PLANNER_LOG_RAW_OUTPUT: bool = Field(
+        default=False,
+        description="When True, log truncated raw LLM outputs on schema parse failures for diagnostics. Disabled by default to avoid accidental PII leakage.",
+    )
+
+    PLANNER_RAW_OUTPUT_MAX_CHARS: int = Field(
+        default=800,
+        ge=100,
+        le=5000,
+        description="Maximum characters of raw LLM output to retain/log when PLANNER_LOG_RAW_OUTPUT is enabled.",
+    )
+
     # ── Memory ────────────────────────────────────────────────────────────────
 
     CONVERSATION_MAX_TOKENS: int = Field(
@@ -187,6 +214,31 @@ class CyraxSettings(BaseSettings):
         ge=1,
         le=10,
         description="Failed PIN attempts before lockout is triggered.",
+    )
+
+    # ── JWT (Phase 9.5C — Distributed API Authentication) ────────────────────
+
+    JWT_SECRET: str = Field(
+        default="",
+        description=(
+            "HMAC secret used to sign distributed API JWTs (mobile clients). "
+            "When empty, auth_session.create_token() refuses to issue tokens "
+            "and auth_session.decode_token() rejects them with "
+            "AUTH_TOKEN_INVALID. Generate a strong random value for "
+            "production, e.g.: python -c \"import secrets; print(secrets.token_hex(32))\""
+        ),
+    )
+
+    JWT_ALGORITHM: str = Field(
+        default="HS256",
+        description="JWT signing algorithm. Fixed at HS256 in Phase 9.5.",
+    )
+
+    JWT_EXPIRY_MINUTES: int = Field(
+        default=60,
+        ge=1,
+        le=1440,
+        description="Default JWT lifetime in minutes. Frozen at 60 in the Phase 9.5A contract.",
     )
 
     # ── Logging ───────────────────────────────────────────────────────────────
