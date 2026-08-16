@@ -27,6 +27,13 @@ MAX_REACT_STEPS: int = 5
 MAX_SCHEMA_RETRIES: int = 1
 _MAX_ERROR_IN_OBSERVATION: int = 400
 
+# Simple in-process metrics for parse failures and correction attempts.
+# These are lightweight counters intended to be scraped or logged by ops.
+import threading as _threading
+_parse_metrics_lock = _threading.Lock()
+_parse_failures_counter: int = 0
+_correction_attempts_counter: int = 0
+
 
 @dataclass
 class ScratchpadEntry:
@@ -255,6 +262,14 @@ class Planner:
         if parsed is not None:
             return parsed
 
+        # Record a parse failure metric before attempting correction retries
+        try:
+            with _parse_metrics_lock:
+                global _parse_failures_counter
+                _parse_failures_counter += 1
+        except Exception:
+            logger.debug("Failed to record parse failure metric.")
+
         max_retries = getattr(settings, "PLANNER_MAX_SCHEMA_RETRIES", 1)
         backoff_base = getattr(settings, "PLANNER_SCHEMA_RETRY_BACKOFF_SECONDS", 0.5)
 
@@ -262,6 +277,14 @@ class Planner:
             logger.warning(
                 f"[{self._req_id}] PLANNER | Schema error at step {step}, retry {attempt}/{max_retries}."
             )
+
+            # Record a correction attempt metric
+            try:
+                with _parse_metrics_lock:
+                    global _correction_attempts_counter
+                    _correction_attempts_counter += 1
+            except Exception:
+                logger.debug("Failed to record correction attempt metric.")
 
             if getattr(settings, "PLANNER_LOG_RAW_OUTPUT", False):
                 try:
