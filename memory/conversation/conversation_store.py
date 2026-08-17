@@ -164,7 +164,7 @@ class ConversationStore:
 
     # ── Core Interface ────────────────────────────────────────────────────────
 
-    async def add_interaction(self, role: str, content: str) -> None:
+    async def add_interaction(self, role: str, content: str, conversation_id: str | None = None):
         """
         Appends a message to history and triggers eviction if needed.
 
@@ -208,7 +208,7 @@ class ConversationStore:
         await self._apply_eviction()
         await self._save()
 
-    def get_history(self) -> list[dict[str, Any]]:
+    def get_history(self, conversation_id: str | None = None) -> list[dict[str, Any]]:
         """
         Returns the conversation history formatted for LLM injection.
 

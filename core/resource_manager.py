@@ -32,7 +32,7 @@ class Priority(IntEnum):
     TaskQueue's PriorityQueue — IMMEDIATE (0) dequeues before
     BACKGROUND (3) without any extra translation.
     """
-    IMMEDIATE   = 0
+    INTERACTIVE = 0
     USER        = 1
     SCHEDULED   = 2
     BACKGROUND  = 3

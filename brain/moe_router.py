@@ -35,7 +35,7 @@ from typing import Any
 
 from brain.provider_events import ProviderExecutionEvent
 from brain.provider_metrics import ProviderMetricsManager
-from brain.providers.base import BaseProvider, ProviderError
+from brain.providers.base import BaseProvider, ProviderError, GenerationCancelledError, GenerationMode
 from config.settings import settings, ActiveLLM
 
 logger = logging.getLogger(__name__)
@@ -344,17 +344,35 @@ class MoERouter:
         )
 
         try:
+            # Choose generation mode based on provider capabilities and the
+            # planner's need for structured output.
+            gen_mode = GenerationMode.STRUCTURED_JSON if provider.capabilities.structured_json else GenerationMode.TEXT
+            logger.debug(
+                f"[{trace_id}] PLAN | provider={provider.provider_name} | requested_generation_mode={gen_mode.value} | supports_json_mode={provider.capabilities.supports_json_mode}"
+            )
             raw = await provider.generate(
                 messages=messages,
                 system_prompt=system_prompt,
                 max_tokens=600,
                 temperature=0.0,
-                json_mode=provider.capabilities.supports_json_mode,
+                generation_mode=gen_mode,
             )
         except ProviderError as exc:
             logger.error(
                 f"[{trace_id}] PLAN_PROVIDER_ERROR | {exc!r}"
             )
+            try:
+                # Record the provider failure so ProviderMetricsManager penalises
+                # the provider health (e.g. json_validate_failed => degrade).
+                self._metrics.record_event(ProviderExecutionEvent(
+                    provider=provider.provider_name,
+                    intent="planner",
+                    latency_ms=0.0,
+                    success=False,
+                    status_code=getattr(exc, "status_code", 0),
+                ))
+            except Exception:
+                logger.debug("Failed to record PLAN_PROVIDER_ERROR metric.")
             return []
 
         plan = _parse_plan(raw, valid_tool_names, trace_id)
@@ -373,6 +391,7 @@ class MoERouter:
         trace_id:      str,
         provider_name: str | None = None,
         intent:        str = "unknown",
+        cancel_token:  "CancellationToken | None" = None,
     ) -> str:
         """
         Generates a conversational response, attempting provider_name first
@@ -392,7 +411,7 @@ class MoERouter:
         Phase 7.2: each generate() call is timed and recorded as a
         ProviderExecutionEvent via ProviderMetricsManager.
         """
-        candidates = self._build_failover_candidates(provider_name)
+        candidates = self._build_failover_candidates(provider_name, generation_mode=GenerationMode.TEXT)
 
         system_prompt = _build_chat_system_prompt(provider_name or "groq")
         messages = history + [{"role": "user", "content": user_input}]
@@ -418,6 +437,8 @@ class MoERouter:
                         system_prompt=system_prompt,
                         max_tokens=800,
                         temperature=0.7,
+                        generation_mode=GenerationMode.TEXT,
+                        cancel_token=cancel_token,
                     )
                     latency_ms = (time.monotonic() - start) * 1000
 
@@ -433,6 +454,28 @@ class MoERouter:
                             f"after {index} prior failure(s)."
                         )
                     return _sanitize_output(response)
+
+                except TypeError as exc:
+                    # Contract violation: a registered provider does not
+                    # accept cancel_token (or another BaseProvider param).
+                    # This must never happen post-audit, but is caught
+                    # defensively so a future provider addition fails
+                    # loud-but-sanitized instead of leaking a raw TypeError
+                    # to the API response.
+                    logger.error(
+                        f"[{trace_id}] MOE_ROUTER | PROVIDER CONTRACT VIOLATION: "
+                        f"'{candidate_name}'.generate() raised TypeError: {exc}. "
+                        f"This provider does not conform to BaseProvider's signature."
+                    )
+                    raise ProviderError(
+                        f"Provider '{candidate_name}' has an incompatible interface.",
+                        provider=candidate_name, status_code=0, retryable=False,
+                    ) from exc
+
+                except GenerationCancelledError:
+                    # Do NOT failover on cancellation — propagate immediately.
+                    logger.info(f"[{trace_id}] MOE_ROUTER | Generation cancelled during chat() on '{candidate_name}'.")
+                    raise
 
                 except ProviderError as exc:
                     latency_ms = (time.monotonic() - start) * 1000
@@ -489,10 +532,12 @@ class MoERouter:
         *,
         max_tokens:     int = 800,
         temperature:    float = 0.7,
+        generation_mode: "GenerationMode | str" = GenerationMode.TEXT,
         json_mode:      bool = False,
         provider_name:  str | None = None,
         intent:         str = "unknown",
         trace_id:       str = "",
+        cancel_token:   "CancellationToken | None" = None,
     ) -> str:
         """
         Failover-wrapped equivalent of BaseProvider.generate(). Used by
@@ -510,11 +555,19 @@ class MoERouter:
             parsing and trigger Planner's existing schema-retry path,
             rather than crashing the task outright).
         """
-        candidates = self._build_failover_candidates(provider_name)
+        # Filter candidates by the requested generation_mode capability so we don't
+        # ask providers to do work they don't claim to support.
+        try:
+            gen_mode = generation_mode if isinstance(generation_mode, GenerationMode) else GenerationMode(generation_mode)
+        except Exception:
+            gen_mode = GenerationMode.TEXT
+        candidates = self._build_failover_candidates(provider_name, generation_mode=gen_mode)
 
         last_error: ProviderError | None = None
+        tried_providers: list[str] = []
 
         for index, candidate_name in enumerate(candidates):
+            tried_providers.append(candidate_name)
             provider = self._providers.get(candidate_name)
             if provider is None:
                 logger.warning(
@@ -533,7 +586,9 @@ class MoERouter:
                         system_prompt=system_prompt,
                         max_tokens=max_tokens,
                         temperature=temperature,
+                        generation_mode=gen_mode,
                         json_mode=json_mode and provider.capabilities.supports_json_mode,
+                        cancel_token=cancel_token,
                     )
                     latency_ms = (time.monotonic() - start) * 1000
 
@@ -549,6 +604,28 @@ class MoERouter:
                             f"'{candidate_name}' after {index} prior failure(s)."
                         )
                     return response
+
+                except TypeError as exc:
+                    # Contract violation: a registered provider does not
+                    # accept cancel_token (or another BaseProvider param).
+                    # This must never happen post-audit, but is caught
+                    # defensively so a future provider addition fails
+                    # loud-but-sanitized instead of leaking a raw TypeError
+                    # to the API response.
+                    logger.error(
+                        f"[{trace_id}] MOE_ROUTER | PROVIDER CONTRACT VIOLATION: "
+                        f"'{candidate_name}'.generate() raised TypeError: {exc}. "
+                        f"This provider does not conform to BaseProvider's signature."
+                    )
+                    raise ProviderError(
+                        f"Provider '{candidate_name}' has an incompatible interface.",
+                        provider=candidate_name, status_code=0, retryable=False,
+                    ) from exc
+
+                except GenerationCancelledError:
+                    # Do NOT failover on cancellation — propagate immediately.
+                    logger.info(f"[{trace_id}] MOE_ROUTER | Generation cancelled during generate() on '{candidate_name}'.")
+                    raise
 
                 except ProviderError as exc:
                     latency_ms = (time.monotonic() - start) * 1000
@@ -592,25 +669,99 @@ class MoERouter:
             f"[{trace_id}] MOE_ROUTER | "
             f"generate(): all providers exhausted. Last error: {last_error!r}"
         )
+
+        # If structured JSON was requested and providers failed with retryable
+        # formatting errors (e.g. Groq json_validate_failed), attempt a second
+        # pass asking text-capable providers for machine-readable JSON (plain
+        # text) instead of server-validated structured JSON.
+        try:
+            if gen_mode == GenerationMode.STRUCTURED_JSON:
+                logger.info(f"[{trace_id}] MOE_ROUTER | Attempting text-mode fallback after structured_json exhaustion.")
+                text_candidates = self._build_failover_candidates(provider_name, generation_mode=GenerationMode.TEXT)
+                # Exclude providers we already tried
+                text_candidates = [p for p in text_candidates if p not in tried_providers]
+
+                for candidate_name in text_candidates:
+                    provider = self._providers.get(candidate_name)
+                    if provider is None:
+                        continue
+                    semaphore = self._resource_manager.get_provider_semaphore(candidate_name)
+                    start = time.monotonic()
+                    async with semaphore:
+                        try:
+                            response = await provider.generate(
+                                messages=messages,
+                                system_prompt=system_prompt,
+                                max_tokens=max_tokens,
+                                temperature=temperature,
+                                generation_mode=GenerationMode.TEXT,
+                                json_mode=False,
+                                cancel_token=cancel_token,
+                            )
+                            latency_ms = (time.monotonic() - start) * 1000
+                            self._metrics.record_event(ProviderExecutionEvent(
+                                provider=candidate_name, intent=intent, latency_ms=latency_ms,
+                                success=True, status_code=200,
+                            ))
+                            logger.info(
+                                f"[{trace_id}] MOE_ROUTER | Structured->TEXT fallback succeeded via '{candidate_name}'."
+                            )
+                            return response
+
+                        except ProviderError as exc:
+                            self._metrics.record_event(ProviderExecutionEvent(
+                                provider=candidate_name, intent=intent, latency_ms=(time.monotonic() - start) * 1000,
+                                success=False, status_code=exc.status_code,
+                            ))
+                            logger.warning(f"[{trace_id}] MOE_ROUTER | Text-fallback provider '{candidate_name}' failed: {exc}")
+                            continue
+        except Exception:
+            logger.debug("Failed during structured->text fallback attempt.")
+
         return (
             '{"thought": "All providers unavailable", "action": null, '
             '"action_args": {}, "final_answer": '
             '"I am unable to reach any AI provider right now. Please try again shortly."}'
         )
 
-    def _build_failover_candidates(self, provider_name: str | None) -> list[str]:
+    def _build_failover_candidates(self, provider_name: str | None, generation_mode: "GenerationMode | None" = None) -> list[str]:
         """
         Builds the ordered candidate list: the requested provider first
         (if supplied and registered), followed by the remaining registered
         providers in a stable default order.
+
+        When generation_mode is supplied, only providers that declare the
+        corresponding capability in ProviderCapabilities are included. This
+        prevents asking providers to perform generation modes they don't
+        advertise support for (per the V12 maintenance directive).
         """
         default_order = ["groq", "gemini", "ollama"]
 
-        if provider_name and provider_name in self._providers:
-            rest = [p for p in default_order if p != provider_name and p in self._providers]
+        def supports_mode(provider_name: str) -> bool:
+            if generation_mode is None:
+                return True
+            provider = self._providers.get(provider_name)
+            if provider is None:
+                return False
+            # Map GenerationMode to the capability flag name
+            if generation_mode == GenerationMode.TEXT:
+                return getattr(provider.capabilities, "text", True)
+            if generation_mode == GenerationMode.STREAMING_TEXT:
+                return getattr(provider.capabilities, "streaming_text", False)
+            if generation_mode == GenerationMode.STRUCTURED_JSON:
+                return getattr(provider.capabilities, "structured_json", False)
+            if generation_mode == GenerationMode.STREAMING_STRUCTURED_JSON:
+                return getattr(provider.capabilities, "streaming_structured_json", False)
+            return False
+
+        # Build ordered list while filtering by support
+        ordered = [p for p in default_order if p in self._providers and supports_mode(p)]
+
+        if provider_name and provider_name in ordered:
+            rest = [p for p in ordered if p != provider_name]
             return [provider_name] + rest
 
-        return [p for p in default_order if p in self._providers]
+        return ordered
 
     # ── Provider Selection ────────────────────────────────────────────────────
 

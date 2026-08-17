@@ -243,12 +243,15 @@ class Planner:
 
         messages = recent_history + [{"role": "user", "content": user_message}]
 
+        from brain.providers.base import GenerationMode
+
         raw = await self._ctx.brain_router.generate(
             messages=messages,
             system_prompt=system_prompt,
             max_tokens=400,
             temperature=0.0,
             json_mode=True,
+            generation_mode=GenerationMode.STRUCTURED_JSON,
             provider_name=self._provider_name,
             intent="react_think",
             trace_id=self._req_id,
@@ -298,12 +301,15 @@ class Planner:
                 bad_output=raw, parse_error="Invalid JSON structure or missing keys."
             )
 
+            # Request a corrected structured response; include both legacy json_mode
+            # for backward-compatible routers and the explicit generation_mode flag.
             raw = await self._ctx.brain_router.generate(
                 messages=[{"role": "user", "content": correction_prompt}],
                 system_prompt=system_prompt,
                 max_tokens=400,
                 temperature=0.0,
                 json_mode=True,
+                generation_mode=GenerationMode.STRUCTURED_JSON,
                 provider_name=self._provider_name,
                 intent="react_think_correction",
                 trace_id=self._req_id,

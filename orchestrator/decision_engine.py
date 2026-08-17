@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 
 from brain.provider_metrics import ProviderMetricsManager
 from brain.provider_selector import ProviderSelector
-from brain.providers.base import BaseProvider, ProviderError
+from brain.providers.base import BaseProvider, ProviderError, GenerationMode
 
 logger = logging.getLogger(__name__)
 
@@ -222,28 +222,38 @@ class DecisionEngine:
         """
         system_prompt = _build_classification_prompt()
 
+        # For classification we prefer a structured JSON response when the
+        # provider supports it. Use GenerationMode so provider adapters decide
+        # how to map to vendor-side parameters (SDK response_format, etc.).
+        gen_mode = GenerationMode.STRUCTURED_JSON if self._provider.capabilities.structured_json else GenerationMode.TEXT
+
+        logger.debug(
+            f"[DECISION_ENGINE] Classification request -> provider={self._provider.provider_name} | "
+            f"capabilities(structured_json={self._provider.capabilities.structured_json}, supports_json_mode={self._provider.capabilities.supports_json_mode}) | "
+            f"requested_generation_mode={gen_mode.value}"
+        )
+
         try:
             raw = await self._provider.generate(
                 messages=[{"role": "user", "content": user_input}],
                 system_prompt=system_prompt,
                 max_tokens=180,
                 temperature=0.0,
-                json_mode=self._provider.capabilities.supports_json_mode,
+                generation_mode=gen_mode,
             )
         except ProviderError as exc:
             logger.error(
                 f"[DECISION_ENGINE] Provider call failed: {exc!r}. "
-                f"Falling back to UNKNOWN/tools_required=True."
+                f"Falling back to heuristic-derived routing." 
             )
-            return self._fallback_decision()
+            return await self._fallback_decision(user_input)
 
         parsed = self._parse_and_validate(raw)
         if parsed is None:
             logger.warning(
-                f"[DECISION_ENGINE] Unparseable classification output: "
-                f"'{raw[:150]}'. Falling back to UNKNOWN/tools_required=True."
+                f"[DECISION_ENGINE] Unparseable classification output: '{raw[:150]}'. Falling back to heuristic-derived routing."
             )
-            return self._fallback_decision()
+            return await self._fallback_decision(user_input)
 
         intent, tools_required, confidence, reason, execution_mode = parsed
 
@@ -341,18 +351,45 @@ Returns (intent, tools_required, confidence, reason, execution_mode)
 
         return intent_raw, tools_required_raw, confidence, reason, execution_mode  # type: ignore[return-value]
 
-    @staticmethod
-    def _fallback_decision() -> CognitiveRoutingDecision:
+    async def _fallback_decision(self, user_input: str) -> CognitiveRoutingDecision:
         """
-        Fail-safe default. Asymmetric by design: fails toward tools_required
-        =True (more capability), not False (silent conversational answer to
-        a possibly action-requiring request).
+        Heuristic fallback when classification fails or a provider error
+        occurred. Uses a lightweight deterministic keyword-based test to
+        decide whether tools are likely required. Then selects a provider
+        using the ProviderSelector so the router receives a reasonable
+        candidate instead of always defaulting to 'groq'.
         """
+        text = (user_input or "").lower()
+        tooly_keywords = [
+            "open ", "close ", "delete ", "remove ", "save ", "write ", "create ",
+            "run ", "execute ", "install ", "download ", "upload ", "schedule",
+            "remind", "reminder", "search the web", "browse ", "open file", "delete file",
+        ]
+
+        tools_required = any(k in text for k in tooly_keywords)
+
+        # Prefer a healthier provider for fallbacks — ask ProviderSelector
+        # for a best-effort candidate using UNKNOWN intent. This keeps the
+        # downstream Planner/Dispatcher from being forced to use a single
+        # provider name regardless of health.
+        selected_provider, selection_trace = self._selector.select_provider(
+            intent="UNKNOWN",
+            active_providers=self._active_providers,
+            metrics=self._metrics,
+        )
+
+        logger.info(
+            f"[DECISION_ENGINE] Heuristic fallback -> tools_required={tools_required} | "
+            f"selected_provider={selected_provider} | selection_trace='{selection_trace}'"
+        )
+
+        execution_mode = ExecutionMode.INTERACTIVE if tools_required else ExecutionMode.IMMEDIATE
+
         return CognitiveRoutingDecision(
             intent="UNKNOWN",
-            tools_required=True,
-            selected_provider="groq",
-            execution_mode=ExecutionMode.INTERACTIVE,
+            tools_required=tools_required,
+            selected_provider=selected_provider,  # type: ignore[arg-type]
+            execution_mode=execution_mode,
             confidence=0.0,
-            reason="Classification failed; defaulting to safe fallback.",
+            reason="Classification failed; heuristic fallback used.",
         )

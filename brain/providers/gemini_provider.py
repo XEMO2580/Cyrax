@@ -28,7 +28,8 @@ from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
 
-from brain.providers.base import BaseProvider, ProviderCapabilities, ProviderError
+from brain.providers.base import BaseProvider, ProviderCapabilities, ProviderError, GenerationMode
+from core.interrupt_controller import CancellationToken
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,11 @@ class GeminiProvider(BaseProvider):
         supports_tool_schemas  = True,
         max_output_tokens      = 8192,
         context_window_tokens  = 1048576,
+        text                   = True,
+        streaming_text         = False,
+        structured_json        = False,
+        streaming_structured_json = False,
+        cancellation           = False,
     )
 
     def __init__(self) -> None:
@@ -94,14 +100,28 @@ class GeminiProvider(BaseProvider):
         *,
         max_tokens:    int   = 800,
         temperature:   float = 0.7,
+        generation_mode: "GenerationMode | str" = GenerationMode.TEXT,
         json_mode:     bool  = False,
         tools:         list[dict] | None = None,
+        cancel_token:  CancellationToken | None = None,
     ) -> str:
-        if json_mode:
+        # cancel_token is accepted but NOT YET checked mid-call — Gemini
+        # has no streaming path in this gate. Documented limitation, not
+        # a silent gap: MoERouter can call this provider without a
+        # TypeError, which is this fix's actual scope.
+        
+        # Map generation_mode to a developer-visible warning when the
+        # provider doesn't support the requested mode.
+        try:
+            mode = generation_mode if isinstance(generation_mode, GenerationMode) else GenerationMode(generation_mode)
+        except Exception:
+            mode = GenerationMode.TEXT
+
+        if (mode in {GenerationMode.STRUCTURED_JSON, GenerationMode.STREAMING_STRUCTURED_JSON}) or json_mode:
             logger.warning(
-                "[GEMINI] json_mode=True requested but Gemini does not support "
-                "native JSON mode. Proceeding without — caller should use Groq "
-                "for planning tasks."
+                "[GEMINI] Structured JSON requested but Gemini does not support "
+                "native server-side JSON validation. Proceeding in text mode — "
+                "caller should prefer Groq for strict planner/classifier calls."
             )
 
         contents, system_instruction = self._build_contents(messages, system_prompt)

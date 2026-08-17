@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     tools_required  INTEGER NOT NULL DEFAULT 0,
     provider_name   TEXT NOT NULL DEFAULT 'groq',
     interruptible   INTEGER NOT NULL DEFAULT 1,
-    priority        INTEGER NOT NULL DEFAULT 3,
+    conversation_id TEXT,
+    device_id       TEXT,
     result          TEXT,
     error           TEXT,
     created_at      TEXT NOT NULL,
@@ -39,11 +40,6 @@ CREATE TABLE IF NOT EXISTS jobs (
     scheduled_at    TEXT
 );
 """
-
-# Phase 8.6 migration: add the priority column to databases created by
-# earlier phases (the CREATE TABLE IF NOT EXISTS above only helps fresh
-# DBs, not an existing jobs table lacking the column).
-_ADD_PRIORITY_COLUMN_SQL = "ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 3"
 
 # ── Phase 7.3: LearningRouter routing_history table ──────────────────────────
 
@@ -67,7 +63,7 @@ ON routing_history (intent_family, provider);
 
 
 def _row_to_task(row: aiosqlite.Row) -> Task:
-    task = Task(
+    return Task(
         task_id=row["job_id"],
         user_input=row["user_input"],
         task_type=TaskType(row["task_type"]),
@@ -75,17 +71,14 @@ def _row_to_task(row: aiosqlite.Row) -> Task:
         tools_required=bool(row["tools_required"]),
         provider_name=row["provider_name"],
         interruptible=bool(row["interruptible"]),
+        conversation_id=row["conversation_id"],   # ADDED — None for pre-migration rows
+        device_id=row["device_id"],                 # ADDED — None for pre-migration rows
         result=row["result"],
         error=row["error"],
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
         scheduled_at=datetime.fromisoformat(row["scheduled_at"]) if row["scheduled_at"] else None,
     )
-    # Phase 8.6 — restore persisted priority. Defaults to BACKGROUND (3)
-    # if the column is absent on a not-yet-migrated old database.
-    if "priority" in row.keys():
-        task.priority = row["priority"]
-    return task
 
 
 class SQLiteJobStore:
@@ -107,24 +100,31 @@ class SQLiteJobStore:
         self._conn = await aiosqlite.connect(str(self._db_path))
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute(_CREATE_TABLE_SQL)
+        await self._migrate_add_missing_columns()   # ADDED
         await self._conn.execute(_CREATE_ROUTING_HISTORY_TABLE_SQL)
         await self._conn.execute(_CREATE_ROUTING_HISTORY_INDEX_SQL)
-
-        # Phase 8.6 migration — add priority to pre-existing databases.
-        # Best-effort: if the column already exists, SQLite raises
-        # OperationalError("duplicate column name") which we swallow.
-        try:
-            await self._conn.execute(_ADD_PRIORITY_COLUMN_SQL)
-            await self._conn.commit()
-            logger.info("[JOB_STORE] Applied Phase 8.6 migration: added 'priority' column.")
-        except Exception as exc:
-            logger.debug(
-                f"[JOB_STORE] priority column already present (or migration "
-                f"not needed): {exc}"
-            )
-
         await self._conn.commit()
         logger.info(f"[JOB_STORE] Initialised. DB: {self._db_path}")
+
+    async def _migrate_add_missing_columns(self) -> None:
+        """
+        Idempotent, non-destructive: adds conversation_id/device_id to an
+        EXISTING jobs table if a pre-Gate-C.1 database is being opened.
+        Fresh installs already get both via _CREATE_TABLE_SQL — this path
+        exists only for upgrades. No data loss, no table rebuild.
+        """
+        cursor = await self._conn.execute("PRAGMA table_info(jobs)")
+        existing_columns = {row["name"] for row in await cursor.fetchall()}
+
+        if "conversation_id" not in existing_columns:
+            await self._conn.execute("ALTER TABLE jobs ADD COLUMN conversation_id TEXT")
+            logger.info("[JOB_STORE] Migration: added conversation_id column.")
+
+        if "device_id" not in existing_columns:
+            await self._conn.execute("ALTER TABLE jobs ADD COLUMN device_id TEXT")
+            logger.info("[JOB_STORE] Migration: added device_id column.")
+
+        await self._conn.commit()
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -144,22 +144,38 @@ class SQLiteJobStore:
             """
             INSERT INTO jobs (
                 job_id, user_input, task_type, status, tools_required,
-                provider_name, interruptible, priority, result, error,
-                created_at, updated_at, scheduled_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                provider_name, interruptible, conversation_id, device_id,
+                result, error, created_at, updated_at, scheduled_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task.task_id, task.user_input, task.task_type.value,
                 task.status.value, int(task.tools_required),
                 task.provider_name, int(task.interruptible),
-                int(task.priority),
+                task.conversation_id, task.device_id,
                 task.result, task.error,
                 task.created_at.isoformat(), task.updated_at.isoformat(),
                 task.scheduled_at.isoformat() if task.scheduled_at else None,
             ),
         )
         await conn.commit()
-        logger.debug(f"[JOB_STORE] Inserted: {task.task_id}")
+
+    async def get_tasks_for_device(self, device_id: str, limit: int = 100) -> list[Task]:
+        """P0.2 support: bounded, recent-first, strictly device-scoped."""
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT * FROM jobs WHERE device_id = ? ORDER BY created_at DESC LIMIT ?",
+            (device_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return [_row_to_task(row) for row in rows]
+
+    async def get_job(self, task_id: str) -> Task | None:
+        """Fetch a single job by job_id. Returns None if not found."""
+        conn = self._require_conn()
+        cursor = await conn.execute("SELECT * FROM jobs WHERE job_id = ?", (task_id,))
+        row = await cursor.fetchone()
+        return _row_to_task(row) if row else None
 
     async def update_status(
         self,
@@ -205,6 +221,58 @@ class SQLiteJobStore:
         )
         rows = await cursor.fetchall()
         return [_row_to_task(row) for row in rows]
+
+    async def get_jobs(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        status: str | None = None,
+    ) -> tuple[list[Task], int]:
+        """
+        Returns a page of jobs (most recent first) and the total count.
+
+        This is the persistence-backed source for `GET /api/v1/jobs`
+        (`docs/api/rest.md` §3 GET /jobs). It queries the SQLite `jobs`
+        table so historical/terminated jobs survive a process restart and
+        are visible to the API, unlike the in-memory TaskQueue dict.
+
+        Args:
+            limit:  Max rows to return (default 20).
+            offset: Row offset for pagination (default 0).
+            status: Optional TaskStatus filter. If provided, only jobs in
+                    that state are returned.
+
+        Returns:
+            A (jobs, total_count) tuple. `jobs` is the page of Task objects
+            ordered newest-first; `total_count` is the number of rows
+            matching the (optional) status filter BEFORE pagination.
+        """
+        conn = self._require_conn()
+
+        where_sql = ""
+        params: list = []
+        if status is not None:
+            where_sql = "WHERE status = ?"
+            params.append(status)
+
+        total_cursor = await conn.execute(
+            f"SELECT COUNT(*) AS total FROM jobs {where_sql}",
+            params,
+        )
+        total_row = await total_cursor.fetchone()
+        total_count = int(total_row["total"]) if total_row else 0
+
+        cursor = await conn.execute(
+            f"""
+            SELECT * FROM jobs
+            {where_sql}
+            ORDER BY created_at DESC, job_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            params + [limit, offset],
+        )
+        rows = await cursor.fetchall()
+        return [_row_to_task(row) for row in rows], total_count
 
     async def recover_pending_jobs(self) -> list[Task]:
         """

@@ -29,6 +29,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+from core.interrupt_controller import CancellationToken
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PROVIDER EXCEPTION
@@ -70,6 +72,16 @@ class ProviderError(Exception):
 # PROVIDER CAPABILITY FLAGS
 # ══════════════════════════════════════════════════════════════════════════════
 
+from enum import Enum
+
+
+class GenerationMode(str, Enum):
+    TEXT = "text"
+    STREAMING_TEXT = "streaming_text"
+    STRUCTURED_JSON = "structured_json"
+    STREAMING_STRUCTURED_JSON = "streaming_structured_json"
+
+
 class ProviderCapabilities:
     """
     Declares what a provider natively supports.
@@ -81,6 +93,11 @@ class ProviderCapabilities:
         supports_tool_schemas:  Provider can consume OpenAI-style function schemas.
         max_output_tokens:      Hard ceiling on tokens the provider will generate.
         context_window_tokens:  Maximum tokens the provider accepts as input.
+        text:                   Supports plain text generation.
+        streaming_text:         Supports streaming plain text generation.
+        structured_json:        Supports structured JSON generation (server-side validated when available).
+        streaming_structured_json: Supports streaming structured JSON.
+        cancellation:           Supports generation cancellation via CancellationToken.
     """
 
     def __init__(
@@ -90,12 +107,23 @@ class ProviderCapabilities:
         supports_tool_schemas:  bool = False,
         max_output_tokens:      int  = 1024,
         context_window_tokens:  int  = 8192,
+        text:                   bool = True,
+        streaming_text:         bool = False,
+        structured_json:        bool = False,
+        streaming_structured_json: bool = False,
+        cancellation:           bool = False,
     ) -> None:
         self.supports_json_mode     = supports_json_mode
         self.supports_system_prompt = supports_system_prompt
         self.supports_tool_schemas  = supports_tool_schemas
         self.max_output_tokens      = max_output_tokens
         self.context_window_tokens  = context_window_tokens
+        self.text                   = text
+        self.streaming_text         = streaming_text
+        self.structured_json        = structured_json
+        self.streaming_structured_json = streaming_structured_json
+        self.cancellation           = cancellation
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -114,8 +142,12 @@ class BaseProvider(ABC):
         4. Catch ALL vendor SDK exceptions inside generate() and re-raise
            as ProviderError. Nothing from the vendor SDK leaks above this class.
 
-    The router always calls generate(). It never calls vendor SDK methods.
-    """
+     The router always calls generate(). It never calls vendor SDK methods.
+     Diff only. BaseProvider.generate() signature extended with an optional
+     cancel_token parameter. Providers that don't support streaming/cancellation
+     simply ignore it (existing behavior preserved). Providers that do (GroqProvider,
+     this gate) branch into a streaming code path only when a token is supplied.
+"""
 
     #: Short lowercase identifier. Set on every concrete subclass.
     provider_name: str = "base"
@@ -126,12 +158,14 @@ class BaseProvider(ABC):
     @abstractmethod
     async def generate(
         self,
-        messages:      list[dict],
-        system_prompt: str,
+        messages:       list[dict],
+        system_prompt:  str,
         *,
-        max_tokens:    int  = 800,
-        temperature:   float = 0.7,
-        json_mode:     bool = False,
+        max_tokens:     int  = 800,
+        temperature:    float = 0.7,
+        generation_mode: "GenerationMode | str" = GenerationMode.TEXT,
+        json_mode:      bool = False,
+        cancel_token:   "CancellationToken | None" = None,
     ) -> str:
         """
         Generate a text response from the provider.
@@ -163,6 +197,19 @@ class BaseProvider(ABC):
             ProviderError: On any vendor API failure, quota exhaustion, timeout,
                            or empty response. Always includes provider_name and
                            retryable flag so the failover layer can decide.
+        cancel_token: Optional. When supplied AND the provider supports
+                      streaming cancellation (see GroqProvider), generation
+                      runs via a chunk-by-chunk streaming call, checking
+                      cancel_token.is_cancelled after every chunk. If set
+                      mid-stream, the provider terminates the stream
+                      immediately, discards accumulated partial output,
+                      and raises GenerationCancelledError (not
+                      ProviderError — this is not a failure, it's an
+                      intentional stop).
+
+                      When None (the default — e.g. DecisionEngine's
+                      classification calls), behavior is UNCHANGED from
+                      before this gate: a single non-streaming call.
         """
         ...
 
@@ -185,3 +232,18 @@ class BaseProvider(ABC):
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(provider={self.provider_name!r})"
+
+class GenerationCancelledError(Exception):
+        """
+        Raised by a streaming-capable provider when cancel_token.is_cancelled
+        became True mid-stream. Distinct from ProviderError — this is not a
+        vendor/network failure, it is the intended outcome of a Kill Switch
+        request. Callers (TaskExecutor) catch this specifically to route to
+        the CANCELLED terminal state rather than FAILED.
+        """
+        def __init__(self, partial_chunks_discarded: int = 0) -> None:
+            self.partial_chunks_discarded = partial_chunks_discarded
+            super().__init__(
+                f"Generation cancelled after {partial_chunks_discarded} chunk(s). "
+                f"Incomplete output discarded, per Gate C requirement 18."
+            )

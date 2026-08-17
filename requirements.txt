@@ -1,0 +1,17 @@
+# CYRAX 3.0 — Distributed API runtime dependencies (Phase 9.5B/9.5C)
+#
+# JWT signing is implemented with the standard library (hmac/sha256/base64url)
+# in security/auth_session.py — no PyJWT dependency is required.
+
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+# Core OS LLM providers (required by app.bootstrap Step 6 — LLM providers)
+groq>=1.0.0
+google-genai>=2.0.0
+
+# Core OS configuration / persistence
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+bcrypt>=4.0.0
+aiosqlite>=0.19.0

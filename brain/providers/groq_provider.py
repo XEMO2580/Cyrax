@@ -21,7 +21,14 @@ from groq import (
     BadRequestError,
 )
 
-from brain.providers.base import BaseProvider, ProviderCapabilities, ProviderError
+from brain.providers.base import (
+    BaseProvider,
+    ProviderCapabilities,
+    ProviderError,
+    GenerationCancelledError,
+    GenerationMode,
+)
+from core.interrupt_controller import CancellationToken
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -50,6 +57,11 @@ class GroqProvider(BaseProvider):
         supports_tool_schemas  = True,
         max_output_tokens      = 8192,
         context_window_tokens  = 131072,
+        text                   = True,
+        streaming_text         = True,
+        structured_json        = True,
+        streaming_structured_json = False,
+        cancellation           = True,
     )
 
     def __init__(self) -> None:
@@ -72,11 +84,28 @@ class GroqProvider(BaseProvider):
         *,
         max_tokens:    int   = 800,
         temperature:   float = 0.7,
+        generation_mode: "GenerationMode | str" = GenerationMode.TEXT,
         json_mode:     bool  = False,
         tools:         list[dict] | None = None,
+        cancel_token: Any = None,
     ) -> str:
         api_messages = self._build_messages(messages, system_prompt)
 
+        # ── Streaming path (if cancel_token supplied) ───────────────────────
+        if cancel_token is not None:
+            # Streaming path — map generation_mode -> json_mode for the
+            # legacy streaming implementation so callers can request
+            # streaming structured JSON via generation_mode.
+            try:
+                mode = generation_mode if isinstance(generation_mode, GenerationMode) else GenerationMode(generation_mode)
+            except Exception:
+                mode = GenerationMode.TEXT
+            stream_json = mode in {GenerationMode.STREAMING_STRUCTURED_JSON}
+            return await self._generate_streaming(
+                api_messages, max_tokens, temperature, stream_json, cancel_token
+            )
+
+        # ── Unchanged non-streaming path ────────────────────────────────────
         request_kwargs: dict[str, Any] = {
             "model":       self._model,
             "messages":    api_messages,
@@ -84,7 +113,15 @@ class GroqProvider(BaseProvider):
             "temperature": temperature,
         }
 
-        if json_mode and self.capabilities.supports_json_mode:
+        # Backwards-compatible handling: if caller supplied generation_mode use that,
+        # otherwise fall back to the legacy json_mode boolean.
+        try:
+            mode = generation_mode if isinstance(generation_mode, GenerationMode) else GenerationMode(generation_mode)
+        except Exception:
+            mode = GenerationMode.TEXT
+
+        json_request = (mode in {GenerationMode.STRUCTURED_JSON, GenerationMode.STREAMING_STRUCTURED_JSON}) or json_mode
+        if json_request and self.capabilities.supports_json_mode:
             request_kwargs["response_format"] = {"type": "json_object"}
 
         if tools:
@@ -94,7 +131,8 @@ class GroqProvider(BaseProvider):
         logger.debug(
             f"[GROQ] generate() | messages={len(api_messages)} | "
             f"max_tokens={max_tokens} | temperature={temperature} | "
-            f"json_mode={json_mode} | tools={len(tools) if tools else 0}"
+            f"generation_mode={mode.value if 'mode' in locals() else str(generation_mode)} | "
+            f"response_format_present={'response_format' in request_kwargs} | tools={len(tools) if tools else 0}"
         )
 
         try:
@@ -132,11 +170,28 @@ class GroqProvider(BaseProvider):
             ) from exc
 
         except BadRequestError as exc:
+            # Groq returns a 400 when server-side JSON validation fails
+            # (json_validate_failed). Treat that as a provider-formatting
+            # failure that should allow failover to another model/provider
+            # rather than a hard stop. Log developer-safe diagnostics
+            # (no API keys or full prompts).
+            text = str(exc)
+            is_json_validate = "json_validate_failed" in text or "Failed to validate JSON" in text or "json_validate" in text
+
+            logger.warning(
+                f"[GROQ] BadRequestError (400) from Groq. json_validate_failed={is_json_validate}."
+                f" model={self._model} response_format_set={('response_format' in request_kwargs)}"
+            )
+
+            # When it's a JSON validation problem, allow failover by marking
+            # the ProviderError as retryable=True so MoERouter can try others.
+            retryable_flag = True if is_json_validate else False
+
             raise ProviderError(
                 f"Groq bad request — check message format or model name: {exc}",
                 provider=self.provider_name,
                 status_code=400,
-                retryable=False,
+                retryable=retryable_flag,
             ) from exc
 
         except APITimeoutError as exc:
@@ -174,6 +229,92 @@ class GroqProvider(BaseProvider):
                 status_code=0,
                 retryable=False,
             ) from exc
+
+    async def _generate_streaming(
+        self,
+        api_messages:  list[dict],
+        max_tokens:    int,
+        temperature:   float,
+        json_mode:     bool,
+        cancel_token:  CancellationToken,
+    ) -> str:
+        """
+        Requirement 17/18: streams chunks via AsyncGroq's stream=True
+        interface, checking cancel_token.is_cancelled after EVERY chunk.
+        On cancellation, immediately stops iterating (closes the async
+        generator, which per the SDK's httpx-backed transport terminates
+        the underlying HTTP connection rather than reading it to completion),
+        discards all accumulated chunks, and raises GenerationCancelledError.
+        Never returns partial content as a "success" — either the full
+        stream completes and is returned, or it's cancelled and nothing
+        is returned.
+        """
+        request_kwargs: dict[str, Any] = {
+            "model":       self._model,
+            "messages":    api_messages,
+            "max_tokens":  max_tokens,
+            "temperature": temperature,
+            "stream":      True,
+        }
+        
+        if json_mode and self.capabilities.supports_json_mode:
+            request_kwargs["response_format"] = {"type": "json_object"}
+
+        accumulated: list[str] = []
+
+        try:
+            stream = await self._client.chat.completions.create(**request_kwargs)
+
+            async for chunk in stream:
+                # Requirement 16: worker observes the cancellation primitive
+                # DURING the active chunk-generation loop, not just before
+                # or after the call.
+                if cancel_token.is_cancelled:
+                    logger.info(
+                        f"[GROQ:STREAM] Cancellation observed mid-stream "
+                        f"after {len(accumulated)} chunk(s). Closing stream, "
+                        f"discarding partial output."
+                    )
+                    await stream.close()
+                    raise GenerationCancelledError(partial_chunks_discarded=len(accumulated))
+
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    accumulated.append(delta)
+
+            full_content = "".join(accumulated).strip()
+            if not full_content:
+                raise ProviderError(
+                    "Groq streaming call returned no content.",
+                    provider=self.provider_name, 
+                    status_code=0, 
+                    retryable=True,
+                )
+            return full_content
+
+        except GenerationCancelledError:
+            raise
+
+        except RateLimitError as exc:
+            raise ProviderError(f"Groq rate limit exceeded: {exc}", provider=self.provider_name, status_code=429, retryable=True) from exc
+        except AuthenticationError as exc:
+            raise ProviderError(f"Groq authentication failed: {exc}", provider=self.provider_name, status_code=401, retryable=False) from exc
+        except APITimeoutError as exc:
+            raise ProviderError(f"Groq streaming request timed out: {exc}", provider=self.provider_name, status_code=408, retryable=True) from exc
+        except APIConnectionError as exc:
+            raise ProviderError(f"Groq connection error: {exc}", provider=self.provider_name, status_code=0, retryable=True) from exc
+        except ProviderError:
+            raise
+        except BadRequestError as exc:
+            text = str(exc)
+            is_json_validate = "json_validate_failed" in text or "Failed to validate JSON" in text or "json_validate" in text
+            logger.warning(
+                f"[GROQ] Streaming BadRequestError (400). json_validate_failed={is_json_validate}. model={self._model}"
+            )
+            retryable_flag = True if is_json_validate else False
+            raise ProviderError(f"Groq streaming bad request: {exc}", provider=self.provider_name, status_code=400, retryable=retryable_flag) from exc
+        except Exception as exc:
+            raise ProviderError(f"Groq streaming unexpected error: {exc}", provider=self.provider_name, status_code=0, retryable=False) from exc
 
     async def health_check(self) -> bool:
         """

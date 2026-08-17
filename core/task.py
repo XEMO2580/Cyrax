@@ -41,6 +41,8 @@ class Task(BaseModel):
     provider_name:   str        = "groq"
     interruptible:   bool       = True
     priority:        int        = Priority.BACKGROUND.value
+    conversation_id: str | None = None
+    device_id:       str | None = None   # ADDED — Gate C.1 P0.1 ownership
     result:          str | None = None
     error:           str | None = None
     created_at:      datetime   = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -48,4 +50,3 @@ class Task(BaseModel):
     scheduled_at:    datetime | None = None
 
     model_config = {"use_enum_values": False}
-
