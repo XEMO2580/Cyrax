@@ -179,6 +179,20 @@ class CyraxSettings(BaseSettings):
         description="Maximum characters of raw LLM output to retain/log when PLANNER_LOG_RAW_OUTPUT is enabled.",
     )
 
+    PLANNER_MAX_TOKENS: int = Field(
+        default=2048,
+        ge=100,
+        le=4096,
+        description="Maximum tokens generated per planner reasoning step.",
+    )
+
+    PLANNER_WALL_CLOCK_TIMEOUT_SECONDS: float = Field(
+        default=60.0,
+        ge=5.0,
+        le=600.0,
+        description="Maximum total wall-clock time in seconds for a complete planner run.",
+    )
+
     # ── Memory ────────────────────────────────────────────────────────────────
 
     CONVERSATION_MAX_TOKENS: int = Field(

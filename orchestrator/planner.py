@@ -1,12 +1,14 @@
 """
-orchestrator/planner.py — CYRAX 3.0 Phase 8.4.5 ReAct Planner
+orchestrator/planner.py — CYRAX 3.0 Hardened ReAct Planner (Phase 8.4.5 / V12-M2)
 
-Phase 8.4.5 change: _think() no longer calls provider.generate() directly.
-It now calls self._ctx.brain_router.generate(...) — MoERouter's failover-
-wrapped equivalent — so a 429/retryable error during Planner's Think phase
-gets automatic circuit-breaker-aware failover instead of crashing the task.
-_select_provider() is removed; provider_name is passed straight through
-to brain_router.generate() as the requested candidate.
+V12-M2 Hardening:
+  - Strongly typed ReActDecision model with strict mutual exclusivity validation.
+  - PlannerState enum for lifecycle transparency.
+  - Robust JSON normalization with repair telemetry (fences, prose, normalized keys, unpacked args).
+  - Declarative tool argument pre-validation against tool args_schema without retrieving BaseTool instances.
+  - Configurable planner bounds (settings.MAX_AGENT_STEPS, PLANNER_MAX_TOKENS, PLANNER_WALL_CLOCK_TIMEOUT_SECONDS).
+  - Cancellation-aware bounded schema correction retries with backoff.
+  - Safe error boundary handling (ProviderCapabilityError, ProviderError, TimeoutError, CancelledError).
 """
 
 from __future__ import annotations
@@ -14,26 +16,90 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from enum import Enum
+from typing import Any, Type
+
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from config.settings import settings
 from core.interrupt_controller import CancellationToken
+from brain.providers.base import (
+    GenerationCancelledError,
+    GenerationMode,
+    ProviderCapabilityError,
+    ProviderError,
+)
 
 logger = logging.getLogger(__name__)
 
-MAX_REACT_STEPS: int = 5
-MAX_SCHEMA_RETRIES: int = 1
 _MAX_ERROR_IN_OBSERVATION: int = 400
 
 # Simple in-process metrics for parse failures and correction attempts.
-# These are lightweight counters intended to be scraped or logged by ops.
 import threading as _threading
 _parse_metrics_lock = _threading.Lock()
 _parse_failures_counter: int = 0
 _correction_attempts_counter: int = 0
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLANNER STATE & DECISION MODELS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PlannerState(str, Enum):
+    THINKING = "THINKING"
+    ACTION = "ACTION"
+    FINAL = "FINAL"
+    RETRY = "RETRY"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class ReActDecision(BaseModel):
+    thought: str = Field(
+        default="",
+        description="One sentence reasoning for current step.",
+    )
+    action: str | None = Field(
+        default=None,
+        description="Tool name from AVAILABLE TOOLS, or null if you have a final answer.",
+    )
+    action_args: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Arguments for the tool action.",
+    )
+    final_answer: str | None = Field(
+        default=None,
+        description="Final response to the user, or null if not yet done.",
+    )
+
+    @model_validator(mode="after")
+    def validate_mutual_exclusivity(self) -> "ReActDecision":
+        has_action = bool(self.action and self.action.strip())
+        has_final = bool(self.final_answer and self.final_answer.strip())
+
+        if has_action and has_final:
+            raise ValueError(
+                "Exactly one of 'action' or 'final_answer' must be provided, never both."
+            )
+        if not has_action and not has_final:
+            raise ValueError(
+                "Exactly one of 'action' or 'final_answer' must be provided, never neither."
+            )
+
+        if not has_action:
+            self.action = None
+        if not has_final:
+            self.final_answer = None
+
+        return self
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCRATCHPAD
+# ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class ScratchpadEntry:
@@ -53,13 +119,20 @@ class Scratchpad:
         self._entries: list[ScratchpadEntry] = []
 
     def add(
-        self, step: int, thought: str, tool_name: str | None,
-        tool_args: dict[str, Any] | None, observation: str,
+        self,
+        step: int,
+        thought: str,
+        tool_name: str | None,
+        tool_args: dict[str, Any] | None,
+        observation: str,
     ) -> None:
         self._entries.append(
             ScratchpadEntry(
-                step=step, thought=thought, tool_name=tool_name,
-                tool_args=tool_args, observation=observation,
+                step=step,
+                thought=thought,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                observation=observation,
             )
         )
 
@@ -78,6 +151,10 @@ class Scratchpad:
     def step_count(self) -> int:
         return len(self._entries)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROMPT BUILDERS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _build_react_system_prompt(tool_definitions: list[dict]) -> str:
     tools_json = json.dumps(tool_definitions, indent=2)
@@ -126,24 +203,174 @@ def _build_schema_correction_prompt(bad_output: str, parse_error: str) -> str:
     )
 
 
+def _format_tool_validation_error(tool_name: str, exc: Exception) -> str:
+    """
+    Formats Pydantic ValidationErrors or type errors into safe, structured,
+    actionable observation messages for the LLM without leaking raw tracebacks
+    or sensitive inputs.
+    """
+    if isinstance(exc, ValidationError):
+        error_lines = []
+        for err in exc.errors():
+            loc = " -> ".join(str(p) for p in err.get("loc", [])) or "root"
+            msg = err.get("msg", "invalid")
+            error_lines.append(f"{loc}: {msg}.")
+        details = "\n".join(error_lines)
+        return (
+            f"Tool {tool_name} validation failed:\n"
+            f"{details}\n"
+            f"No execution occurred.\n"
+            f"Correct the arguments and retry."
+        )
+    return (
+        f"Tool {tool_name} validation failed:\n"
+        f"{str(exc)}\n"
+        f"No execution occurred.\n"
+        f"Correct the arguments and retry."
+    )
+
+
+def _format_unknown_tool_error(tool_name: str, valid_tools: set[str]) -> str:
+    tools_list = ", ".join(sorted(valid_tools))
+    return (
+        f"Tool '{tool_name}' is not registered.\n"
+        f"Available tools: {tools_list}\n"
+        f"No execution occurred.\n"
+        f"Choose a valid tool name from the AVAILABLE TOOLS list and retry."
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JSON NORMALIZATION & PARSER WITH TELEMETRY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_decision_with_repairs(
+    raw: str | None,
+) -> tuple[ReActDecision | None, list[str]]:
+    """
+    Robustly parses raw model output into a ReActDecision, recording all repair
+    transformations applied.
+    """
+    if raw is None:
+        return None, []
+
+    repairs: list[str] = []
+    cleaned = raw if isinstance(raw, str) else json.dumps(raw)
+    cleaned = cleaned.strip()
+
+    if not cleaned:
+        return None, []
+
+    # 1. Strip Markdown code fences
+    if cleaned.startswith("```"):
+        repairs.append("MARKDOWN_FENCE_STRIPPED")
+        lines = [l for l in cleaned.splitlines() if not l.strip().startswith("```")]
+        cleaned = "\n".join(lines).strip()
+
+    def _try_load(s: str) -> Any:
+        try:
+            return json.loads(s)
+        except json.JSONDecodeError:
+            return None
+
+    parsed = _try_load(cleaned)
+
+    # 2. Extract JSON object from surrounding prose if direct load failed
+    if parsed is None:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            substr = cleaned[start : end + 1]
+            parsed = _try_load(substr)
+            if parsed is not None:
+                repairs.append("PROSE_EXTRACTED")
+
+    if parsed is None:
+        return None, repairs
+
+    # 3. Unwrap list of length 1
+    if isinstance(parsed, list) and parsed:
+        if isinstance(parsed[0], dict):
+            repairs.append("LIST_UNWRAPPED")
+            parsed = parsed[0]
+        else:
+            return None, repairs
+
+    if not isinstance(parsed, dict):
+        return None, repairs
+
+    # 4. Normalize keys
+    thought = parsed.get("thought")
+    if thought is None and "Thought" in parsed:
+        repairs.append("KEY_NORMALIZED")
+        thought = parsed.get("Thought")
+    thought_str = str(thought) if thought is not None else ""
+
+    action = parsed.get("action")
+    if action is None:
+        for alt in ("Action", "action_name", "tool", "tool_name"):
+            if alt in parsed:
+                repairs.append("KEY_NORMALIZED")
+                action = parsed.get(alt)
+                break
+
+    action_args = parsed.get("action_args")
+    if action_args is None:
+        for alt in ("actionArgs", "ActionArgs", "args", "parameters", "arguments"):
+            if alt in parsed:
+                repairs.append("KEY_NORMALIZED")
+                action_args = parsed.get(alt)
+                break
+
+    if action_args is None:
+        action_args = {}
+    elif isinstance(action_args, str):
+        # 5. Stringified JSON arguments
+        try:
+            loaded_args = json.loads(action_args)
+            if isinstance(loaded_args, dict):
+                repairs.append("ARGS_UNPACKED")
+                action_args = loaded_args
+        except Exception:
+            pass
+
+    final_answer = parsed.get("final_answer")
+    if final_answer is None:
+        for alt in ("finalAnswer", "FinalAnswer", "answer", "response"):
+            if alt in parsed:
+                repairs.append("KEY_NORMALIZED")
+                final_answer = parsed.get(alt)
+                break
+
+    try:
+        decision = ReActDecision(
+            thought=thought_str,
+            action=str(action) if action is not None and str(action).strip() else None,
+            action_args=action_args if isinstance(action_args, dict) else {},
+            final_answer=str(final_answer) if final_answer is not None and str(final_answer).strip() else None,
+        )
+        return decision, repairs
+    except (ValidationError, ValueError):
+        return None, repairs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLANNER
+# ══════════════════════════════════════════════════════════════════════════════
+
 class Planner:
     """
-    Sole execution engine for tool-using requests.
+    Sole reasoning and orchestration engine for tool-using requests.
 
-    Args:
-        ctx:            CyraxContext.
-        req_id:          Trace correlation ID.
-        provider_name:   Optional. When set (Decision Engine override),
-                         passed through to brain_router.generate() as the
-                         requested first candidate — MoERouter's own
-                         failover logic decides what happens if that
-                         candidate fails, not Planner.
+    Produces validated actions and delegates execution to the ToolRegistry.
+    Never executes tools or checks security clearance directly.
     """
 
     def __init__(self, ctx: Any, req_id: str, provider_name: str | None = None) -> None:
         self._ctx           = ctx
         self._req_id        = req_id
         self._provider_name = provider_name
+        self._last_raw: str | None = None
 
     async def run(
         self,
@@ -156,21 +383,75 @@ class Planner:
         valid_tool_names = {t["name"] for t in tool_definitions}
         system_prompt = _build_react_system_prompt(tool_definitions)
 
-        for step in range(1, MAX_REACT_STEPS + 1):
+        max_steps = getattr(settings, "MAX_AGENT_STEPS", 5)
+        wall_clock_timeout = getattr(settings, "PLANNER_WALL_CLOCK_TIMEOUT_SECONDS", 60.0)
+        start_time = time.monotonic()
 
+        for step in range(1, max_steps + 1):
+
+            # Check wall-clock timeout
+            if time.monotonic() - start_time > wall_clock_timeout:
+                logger.warning(
+                    f"[{self._req_id}] PLANNER | Wall-clock timeout exceeded ({wall_clock_timeout}s)."
+                )
+                return {
+                    "status": "error",
+                    "response": f"System Error: Planner exceeded maximum execution time of {wall_clock_timeout}s.",
+                    "error_code": "planner_wall_clock_timeout",
+                }
+
+            # Check cancellation before step
             if cancel_token is not None and cancel_token.is_cancelled:
                 logger.info(
-                    f"[{self._req_id}] PLANNER | Cancelled before step {step} "
-                    f"| reason='{cancel_token.reason}'"
+                    f"[{self._req_id}] PLANNER | Cancelled before step {step} | "
+                    f"reason='{cancel_token.reason}'"
                 )
                 raise asyncio.CancelledError(cancel_token.reason)
 
-            decision = await self._think(
-                system_prompt=system_prompt, scratchpad=scratchpad,
-                history=history, step=step, cancel_token=cancel_token,
-            )
+            try:
+                think_result = await self._think(
+                    system_prompt=system_prompt,
+                    scratchpad=scratchpad,
+                    history=history,
+                    step=step,
+                    cancel_token=cancel_token,
+                )
+            except (GenerationCancelledError, asyncio.CancelledError):
+                logger.info(f"[{self._req_id}] PLANNER | Cancellation propagated during think.")
+                raise
+            except ProviderCapabilityError as exc:
+                logger.error(
+                    f"[{self._req_id}] PLANNER | Capability exhaustion at step {step}: {exc}"
+                )
+                return {
+                    "status": "error",
+                    "response": "System Error: No eligible AI provider available for planning capabilities.",
+                    "error_code": "provider_capability_exhaustion",
+                }
+            except ProviderError as exc:
+                logger.error(
+                    f"[{self._req_id}] PLANNER | Provider error at step {step}: {exc}"
+                )
+                if not exc.retryable:
+                    return {
+                        "status": "error",
+                        "response": f"System Error: AI provider configuration error: {exc}",
+                        "error_code": "provider_error",
+                    }
+                return {
+                    "status": "error",
+                    "response": "System Error: All AI providers are currently unavailable. Please try again shortly.",
+                    "error_code": "provider_exhausted",
+                }
+            except asyncio.TimeoutError:
+                logger.error(f"[{self._req_id}] PLANNER | Think step timed out at step {step}.")
+                return {
+                    "status": "error",
+                    "response": f"System Error: Planning request timed out after {settings.BRAIN_TIMEOUT_SECONDS}s.",
+                    "error_code": "planner_timeout",
+                }
 
-            if decision is None:
+            if think_result is None:
                 payload: dict[str, Any] = {
                     "status": "error",
                     "response": "System Error: Could not parse a valid reasoning step.",
@@ -184,22 +465,41 @@ class Planner:
                     logger.debug("Failed to attach raw planner output to error payload.")
                 return payload
 
-            if decision.get("final_answer") is not None:
+            # Handle direct error payload from think if returned
+            if isinstance(think_result, dict) and think_result.get("status") == "error":
+                return think_result
+
+            decision: ReActDecision = think_result
+
+            # Final Answer reached
+            if decision.final_answer is not None:
                 logger.info(f"[{self._req_id}] PLANNER | Final answer at step {step}.")
-                return {"status": "success", "response": str(decision["final_answer"])}
+                return {"status": "success", "response": decision.final_answer}
 
-            tool_name: str = decision.get("action") or ""
-            tool_args: dict = decision.get("action_args") or {}
-            thought:   str = decision.get("thought", "")
+            tool_name: str = decision.action or ""
+            tool_args: dict[str, Any] = decision.action_args or {}
+            thought:   str = decision.thought
 
+            # ── 1. Tool existence check ───────────────────────────────────────
             if not tool_name or tool_name not in valid_tool_names:
-                observation = (
-                    f"Error: '{tool_name}' is not a valid tool name. "
-                    f"Choose from the AVAILABLE TOOLS list."
-                )
+                observation = _format_unknown_tool_error(tool_name, valid_tool_names)
                 scratchpad.add(step, thought, tool_name, tool_args, observation)
                 continue
 
+            # ── 2. Declarative Schema validation (WITHOUT BaseTool instance) ──
+            args_schema = self._ctx.tool_registry.get_tool_schema(tool_name)
+            if args_schema is not None:
+                try:
+                    if hasattr(args_schema, "model_validate"):
+                        args_schema.model_validate(tool_args)
+                    else:
+                        args_schema(**tool_args)
+                except (ValidationError, TypeError, ValueError) as exc:
+                    observation = _format_tool_validation_error(tool_name, exc)
+                    scratchpad.add(step, thought, tool_name, tool_args, observation)
+                    continue
+
+            # ── 3. Cancellation check before tool execution ───────────────────
             if cancel_token is not None and cancel_token.is_cancelled:
                 logger.info(
                     f"[{self._req_id}] PLANNER | Cancelled before tool call "
@@ -207,6 +507,7 @@ class Planner:
                 )
                 raise asyncio.CancelledError(cancel_token.reason)
 
+            # ── 4. Dispatch to tool execution layer ───────────────────────────
             observation, auth_required_result = await self._act(
                 tool_name=tool_name, tool_args=tool_args, step=step,
             )
@@ -216,22 +517,28 @@ class Planner:
 
             scratchpad.add(step, thought, tool_name, tool_args, observation)
 
-        logger.warning(f"[{self._req_id}] PLANNER | MAX_REACT_STEPS ({MAX_REACT_STEPS}) exhausted.")
+        logger.warning(
+            f"[{self._req_id}] PLANNER | MAX_AGENT_STEPS ({max_steps}) exhausted."
+        )
         return {
             "status": "error",
             "response": "System Error: Task exceeded maximum reasoning steps.",
+            "error_code": "max_steps_exceeded",
         }
 
     # ── Think phase — Phase 8.4.5: routed through MoERouter.generate() ──────
 
     async def _think(
-        self, system_prompt: str, scratchpad: Scratchpad, history: list[dict], step: int,
+        self,
+        system_prompt: str,
+        scratchpad: Scratchpad,
+        history: list[dict],
+        step: int,
         cancel_token: CancellationToken | None = None,
-    ) -> dict[str, Any] | None:
-        """Call the router, parse the decision, and optionally attempt schema-correction retries.
-
-        Stores the last raw LLM output on self._last_raw for diagnostics and
-        returns a normalized decision dict or None when parsing repeatedly fails.
+    ) -> ReActDecision | dict[str, Any] | None:
+        """
+        Calls the router in STRUCTURED_JSON mode, parses the decision, and
+        optionally attempts bounded schema-correction retries.
         """
         transcript = scratchpad.render_for_llm()
         recent_history = history[-4:]
@@ -242,13 +549,12 @@ class Planner:
         )
 
         messages = recent_history + [{"role": "user", "content": user_message}]
-
-        from brain.providers.base import GenerationMode
+        max_tokens = getattr(settings, "PLANNER_MAX_TOKENS", 2048)
 
         raw = await self._ctx.brain_router.generate(
             messages=messages,
             system_prompt=system_prompt,
-            max_tokens=400,
+            max_tokens=max_tokens,
             temperature=0.0,
             json_mode=True,
             generation_mode=GenerationMode.STRUCTURED_JSON,
@@ -258,12 +564,28 @@ class Planner:
             cancel_token=cancel_token,
         )
 
-        # Persist last raw for error payloads
         self._last_raw = raw
 
-        parsed = self._parse_decision(raw)
-        if parsed is not None:
-            return parsed
+        decision, repairs = _parse_decision_with_repairs(raw)
+        if decision is not None:
+            if repairs:
+                logger.warning(
+                    f"[{self._req_id}] PLANNER | STRUCTURED_JSON repair applied | "
+                    f"provider={self._provider_name or 'auto'} | "
+                    f"mode=STRUCTURED_JSON | "
+                    f"repairs={repairs} | "
+                    f"success=True"
+                )
+            return decision
+
+        if repairs:
+            logger.warning(
+                f"[{self._req_id}] PLANNER | STRUCTURED_JSON repair attempted but failed | "
+                f"provider={self._provider_name or 'auto'} | "
+                f"mode=STRUCTURED_JSON | "
+                f"repairs={repairs} | "
+                f"success=False"
+            )
 
         # Record a parse failure metric before attempting correction retries
         try:
@@ -277,6 +599,13 @@ class Planner:
         backoff_base = getattr(settings, "PLANNER_SCHEMA_RETRY_BACKOFF_SECONDS", 0.5)
 
         for attempt in range(1, max_retries + 1):
+            if cancel_token is not None and cancel_token.is_cancelled:
+                logger.info(
+                    f"[{self._req_id}] PLANNER | Cancelled during schema retry {attempt} | "
+                    f"reason='{cancel_token.reason}'"
+                )
+                raise asyncio.CancelledError(cancel_token.reason)
+
             logger.warning(
                 f"[{self._req_id}] PLANNER | Schema error at step {step}, retry {attempt}/{max_retries}."
             )
@@ -298,15 +627,13 @@ class Planner:
                     logger.debug("Failed to emit raw planner output for diagnostics.")
 
             correction_prompt = _build_schema_correction_prompt(
-                bad_output=raw, parse_error="Invalid JSON structure or missing keys."
+                bad_output=raw, parse_error="Invalid JSON structure or missing required keys."
             )
 
-            # Request a corrected structured response; include both legacy json_mode
-            # for backward-compatible routers and the explicit generation_mode flag.
             raw = await self._ctx.brain_router.generate(
                 messages=[{"role": "user", "content": correction_prompt}],
                 system_prompt=system_prompt,
-                max_tokens=400,
+                max_tokens=max_tokens,
                 temperature=0.0,
                 json_mode=True,
                 generation_mode=GenerationMode.STRUCTURED_JSON,
@@ -316,13 +643,29 @@ class Planner:
                 cancel_token=cancel_token,
             )
 
-            # update last raw and try parse again
             self._last_raw = raw
-            parsed = self._parse_decision(raw)
-            if parsed is not None:
-                return parsed
+            decision, repairs = _parse_decision_with_repairs(raw)
+            if decision is not None:
+                if repairs:
+                    logger.warning(
+                        f"[{self._req_id}] PLANNER | STRUCTURED_JSON repair applied during retry {attempt} | "
+                        f"provider={self._provider_name or 'auto'} | "
+                        f"mode=STRUCTURED_JSON | "
+                        f"repairs={repairs} | "
+                        f"success=True"
+                    )
+                return decision
 
-            # backoff between attempts
+            if repairs:
+                logger.warning(
+                    f"[{self._req_id}] PLANNER | STRUCTURED_JSON repair attempted during retry {attempt} but failed | "
+                    f"provider={self._provider_name or 'auto'} | "
+                    f"mode=STRUCTURED_JSON | "
+                    f"repairs={repairs} | "
+                    f"success=False"
+                )
+
+            # Backoff between attempts
             try:
                 await asyncio.sleep(backoff_base * attempt)
             except asyncio.CancelledError:
@@ -332,85 +675,15 @@ class Planner:
 
     @staticmethod
     def _parse_decision(raw: str) -> dict[str, Any] | None:
-        """Robustly parse planner output into a normalized decision dict.
-
-        Accepts strings with surrounding text or code fences, attempts to
-        extract the first JSON object if the top-level parsing fails, and
-        normalizes common camelCase keys to the expected snake_case names.
         """
-        if raw is None:
-            return None
+        Backwards-compatible parsing helper returning a normalized dict or None.
+        """
+        decision, _ = _parse_decision_with_repairs(raw)
+        if decision is not None:
+            return decision.model_dump()
+        return None
 
-        # If the brain_router returned a non-string (e.g. already-parsed JSON),
-        # convert it back to a string for consistent handling.
-        cleaned = raw if isinstance(raw, str) else json.dumps(raw)
-        cleaned = cleaned.strip()
-
-        # Remove Markdown code fences if present
-        if cleaned.startswith("```"):
-            lines = [l for l in cleaned.splitlines() if not l.strip().startswith("```")]
-            cleaned = "\n".join(lines).strip()
-
-        def _try_load(s: str):
-            try:
-                return json.loads(s)
-            except json.JSONDecodeError:
-                return None
-
-        parsed = _try_load(cleaned)
-
-        # If direct parse failed, try extracting the first {...} JSON object
-        if parsed is None:
-            start = cleaned.find("{")
-            end = cleaned.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                substr = cleaned[start : end + 1]
-                parsed = _try_load(substr)
-
-        if parsed is None:
-            return None
-
-        # If LLM returned a list like [{...}], accept the first element
-        if isinstance(parsed, list) and parsed:
-            if isinstance(parsed[0], dict):
-                parsed = parsed[0]
-            else:
-                return None
-
-        if not isinstance(parsed, dict):
-            return None
-
-        # Normalize keys to expected names. Handle common camelCase variants.
-        normalized: dict[str, Any] = {}
-        normalized["thought"] = parsed.get("thought") or parsed.get("Thought") or ""
-        normalized["action"] = (
-            parsed.get("action")
-            or parsed.get("Action")
-            or parsed.get("action_name")
-            or parsed.get("tool")
-            or None
-        )
-        normalized["action_args"] = (
-            parsed.get("action_args")
-            or parsed.get("actionArgs")
-            or parsed.get("ActionArgs")
-            or parsed.get("args")
-            or {}
-        )
-        normalized["final_answer"] = (
-            parsed.get("final_answer")
-            or parsed.get("finalAnswer")
-            or parsed.get("FinalAnswer")
-            or None
-        )
-
-        # Require at least the presence of one of action or final_answer
-        if normalized["action"] is None and normalized["final_answer"] is None:
-            return None
-
-        return normalized
-
-    # ── Act phase (unchanged) ────────────────────────────────────────────────
+    # ── Act phase (delegates tool execution) ──────────────────────────────────
 
     async def _act(
         self, tool_name: str, tool_args: dict[str, Any], step: int,

@@ -21,6 +21,7 @@ via conditional checks on exc.code.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -28,13 +29,20 @@ from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
 
-from brain.providers.base import BaseProvider, ProviderCapabilities, ProviderError, GenerationMode
+from brain.providers.base import (
+    BaseProvider,
+    ProviderCapabilities,
+    ProviderError,
+    GenerationMode,
+    GenerationCancelledError,
+    StreamLifecycleState,
+)
 from core.interrupt_controller import CancellationToken
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+_RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({408, 429, 500, 502, 503, 504})
 
 # Gemini's Schema.type only accepts this subset — JSON Schema's broader
 # type vocabulary must be mapped down onto these.
@@ -56,7 +64,8 @@ class GeminiProvider(BaseProvider):
         - System instructions via GenerateContentConfig.system_instruction
         - Native multi-turn history via types.Content objects
         - Very large context window (1M tokens on Gemini 1.5 / 2.x)
-        - JSON mode not natively supported — planner uses Groq instead
+        - Streaming text generation with chunk-level cancellation
+        - Server-side structured JSON validation via response_mime_type
 
     Message format translation:
         Canonical role "assistant" → Gemini role "model"
@@ -68,16 +77,15 @@ class GeminiProvider(BaseProvider):
 
     provider_name = "gemini"
     capabilities  = ProviderCapabilities(
-        supports_json_mode     = False,
+        supports_json_mode     = True,
         supports_system_prompt = True,
         supports_tool_schemas  = True,
         max_output_tokens      = 8192,
         context_window_tokens  = 1048576,
         text                   = True,
-        streaming_text         = False,
-        structured_json        = False,
-        streaming_structured_json = False,
-        cancellation           = False,
+        streaming              = True,
+        structured_json        = True,
+        cancellation           = True,
     )
 
     def __init__(self) -> None:
@@ -105,24 +113,12 @@ class GeminiProvider(BaseProvider):
         tools:         list[dict] | None = None,
         cancel_token:  CancellationToken | None = None,
     ) -> str:
-        # cancel_token is accepted but NOT YET checked mid-call — Gemini
-        # has no streaming path in this gate. Documented limitation, not
-        # a silent gap: MoERouter can call this provider without a
-        # TypeError, which is this fix's actual scope.
-        
-        # Map generation_mode to a developer-visible warning when the
-        # provider doesn't support the requested mode.
         try:
             mode = generation_mode if isinstance(generation_mode, GenerationMode) else GenerationMode(generation_mode)
         except Exception:
             mode = GenerationMode.TEXT
 
-        if (mode in {GenerationMode.STRUCTURED_JSON, GenerationMode.STREAMING_STRUCTURED_JSON}) or json_mode:
-            logger.warning(
-                "[GEMINI] Structured JSON requested but Gemini does not support "
-                "native server-side JSON validation. Proceeding in text mode — "
-                "caller should prefer Groq for strict planner/classifier calls."
-            )
+        json_request = (mode == GenerationMode.STRUCTURED_JSON) or json_mode
 
         contents, system_instruction = self._build_contents(messages, system_prompt)
 
@@ -132,15 +128,22 @@ class GeminiProvider(BaseProvider):
             "max_output_tokens":  max_tokens,
         }
 
+        if json_request and self.capabilities.supports_json_mode:
+            config_kwargs["response_mime_type"] = "application/json"
+
         if tools:
             config_kwargs["tools"] = [self.get_tool_schemas(tools)]
 
         config = types.GenerateContentConfig(**config_kwargs)
 
+        # ── Streaming path (if cancel_token supplied) ───────────────────────
+        if cancel_token is not None:
+            return await self._generate_streaming(contents, config, json_request, cancel_token)
+
         logger.debug(
             f"[GEMINI] generate() | contents={len(contents)} | "
             f"max_tokens={max_tokens} | temperature={temperature} | "
-            f"tools={len(tools) if tools else 0}"
+            f"json_request={json_request} | tools={len(tools) if tools else 0}"
         )
 
         try:
@@ -157,8 +160,22 @@ class GeminiProvider(BaseProvider):
                     provider=self.provider_name, status_code=0, retryable=True,
                 )
 
-            logger.debug(f"[GEMINI] Response received. Length: {len(text)} chars.")
-            return text.strip()
+            cleaned_text = text.strip()
+
+            if json_request:
+                import json
+                try:
+                    json.loads(cleaned_text)
+                except Exception as json_err:
+                    raise ProviderError(
+                        f"Gemini output is not valid JSON in structured mode: {json_err}",
+                        provider=self.provider_name,
+                        status_code=0,
+                        retryable=True,
+                    ) from json_err
+
+            logger.debug(f"[GEMINI] Response received. Length: {len(cleaned_text)} chars.")
+            return cleaned_text
 
         except genai_errors.APIError as exc:
             # The new google.genai SDK wraps most HTTP/API errors here
@@ -187,6 +204,112 @@ class GeminiProvider(BaseProvider):
             raise ProviderError(
                 f"Gemini unexpected error: {exc}",
                 provider=self.provider_name, status_code=0, retryable=False,
+            ) from exc
+
+    async def _generate_streaming(
+        self,
+        contents: list[types.Content],
+        config: types.GenerateContentConfig,
+        json_mode: bool,
+        cancel_token: CancellationToken,
+    ) -> str:
+        logger.debug(f"[GEMINI:STREAM] {StreamLifecycleState.STARTED.value} | model={self._model}")
+        accumulated: list[str] = []
+
+        try:
+            response_stream = await self._client.aio.models.generate_content_stream(
+                model=self._model,
+                contents=contents,
+                config=config,
+            )
+
+            async for chunk in response_stream:
+                if cancel_token.is_cancelled:
+                    logger.info(
+                        f"[GEMINI:STREAM] {StreamLifecycleState.CANCELLED.value} observed mid-stream "
+                        f"after {len(accumulated)} chunk(s). Closing stream, "
+                        f"discarding partial output."
+                    )
+                    raise GenerationCancelledError(partial_chunks_discarded=len(accumulated))
+
+                delta = chunk.text if getattr(chunk, "text", None) else None
+                if delta:
+                    accumulated.append(delta)
+                    logger.debug(
+                        f"[GEMINI:STREAM] {StreamLifecycleState.CHUNK_RECEIVED.value} | "
+                        f"chunk_len={len(delta)} | total_chunks={len(accumulated)}"
+                    )
+
+            full_content = "".join(accumulated).strip()
+            if not full_content:
+                logger.warning(f"[GEMINI:STREAM] {StreamLifecycleState.EMPTY.value} response received.")
+                raise ProviderError(
+                    "Gemini streaming call returned no content.",
+                    provider=self.provider_name,
+                    status_code=0,
+                    retryable=True,
+                )
+
+            if json_mode:
+                import json
+                try:
+                    json.loads(full_content)
+                except Exception as json_err:
+                    logger.warning(f"[GEMINI:STREAM] {StreamLifecycleState.FAILED.value} | invalid JSON in structured mode: {json_err}")
+                    raise ProviderError(
+                        f"Gemini output is not valid JSON in structured streaming mode: {json_err}",
+                        provider=self.provider_name,
+                        status_code=0,
+                        retryable=True,
+                    ) from json_err
+
+            logger.debug(f"[GEMINI:STREAM] {StreamLifecycleState.COMPLETED.value} | Length: {len(full_content)} chars.")
+            return full_content
+
+        except GenerationCancelledError:
+            raise
+
+        except genai_errors.APIError as exc:
+            status_code = getattr(exc, "code", 0) or 0
+            retryable = int(status_code) in _RETRYABLE_STATUS_CODES
+            if status_code == 429:
+                msg = f"Gemini quota exhausted (429): {exc}"
+            elif status_code == 401:
+                msg = f"Gemini authentication failed — check GEMINI_API_KEY: {exc}"
+            elif status_code == 403:
+                msg = f"Gemini permission denied: {exc}"
+            elif status_code == 400:
+                msg = f"Gemini invalid argument: {exc}"
+            else:
+                msg = f"Gemini API error {status_code}: {exc}"
+            logger.warning(f"[GEMINI:STREAM] {StreamLifecycleState.FAILED.value} | {msg}")
+            raise ProviderError(
+                msg, provider=self.provider_name, status_code=int(status_code), retryable=retryable,
+            ) from exc
+
+        except ProviderError:
+            raise
+
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            logger.warning(f"[GEMINI:STREAM] {StreamLifecycleState.TIMEOUT.value} | {exc}")
+            raise ProviderError(
+                f"Gemini streaming request timed out: {exc}",
+                provider=self.provider_name,
+                status_code=408,
+                retryable=True,
+            ) from exc
+
+        except Exception as exc:
+            err_msg = str(exc).lower()
+            is_timeout = "timeout" in err_msg or "timed out" in err_msg
+            status_code = 408 if is_timeout else 0
+            retryable = is_timeout or "connection" in err_msg or "stream" in err_msg
+            logger.warning(f"[GEMINI:STREAM] {StreamLifecycleState.FAILED.value} | {exc}")
+            raise ProviderError(
+                f"Gemini streaming unexpected error: {exc}",
+                provider=self.provider_name,
+                status_code=status_code,
+                retryable=retryable,
             ) from exc
 
     async def health_check(self) -> bool:

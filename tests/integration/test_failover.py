@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from brain.moe_router import MoERouter
-from brain.providers.base import BaseProvider, ProviderCapabilities, ProviderError
+from brain.providers.base import BaseProvider, ProviderCapabilities, ProviderError, ProviderCapabilityError
 from core.resource_manager import ResourceManager
 
 pytestmark = pytest.mark.asyncio
@@ -143,10 +143,10 @@ class TestMoERouterFailover:
         assert len(failover_logs) == 0
         assert "gemini" in result.lower() or "configuration" in result.lower()
 
-    async def test_all_providers_exhausted_returns_graceful_message(self) -> None:
+    async def test_all_providers_exhausted_raises_capability_error(self) -> None:
         """
         Both providers fail with retryable errors — final response must
-        be a graceful user-facing message, not an unhandled exception.
+        be a ProviderCapabilityError for the error boundary to sanitize.
         """
         gemini = _make_mock_provider("gemini")
         gemini.generate.side_effect = ProviderError(
@@ -164,14 +164,15 @@ class TestMoERouterFailover:
             resource_manager=ResourceManager(),
         )
 
-        result = await router.chat(
-            user_input="hello",
-            history=[],
-            trace_id="test-trace-004",
-            provider_name="gemini",
-        )
+        with pytest.raises(ProviderCapabilityError) as exc_info:
+            await router.chat(
+                user_input="hello",
+                history=[],
+                trace_id="test-trace-004",
+                provider_name="gemini",
+            )
 
         gemini.generate.assert_awaited_once()
         groq.generate.assert_awaited_once()
-        assert "trouble" in result.lower() or "try again" in result.lower()
 
+        assert "All AI providers are currently unavailable" in str(exc_info.value) or "try again" in str(exc_info.value)

@@ -106,6 +106,38 @@ class TestPriorityOrdering:
         assert d1.task_id == first.task_id
         assert d2.task_id == second.task_id
 
+    async def test_interactive_and_immediate_aliases_and_ordering(self) -> None:
+        """
+        Verify Priority.INTERACTIVE and Priority.IMMEDIATE share value 0 and both
+        dequeue ahead of USER (1), SCHEDULED (2), BACKGROUND (3), and MAINTENANCE (4).
+        """
+        assert Priority.IMMEDIATE.value == 0
+        assert Priority.INTERACTIVE.value == 0
+        assert Priority.IMMEDIATE == Priority.INTERACTIVE
+
+        queue = TaskQueue(job_store=_FakeJobStore())
+        bg = await queue.submit("bg", TaskType.BACKGROUND, priority=Priority.BACKGROUND.value)
+        maint = await queue.submit("maint", TaskType.BACKGROUND, priority=Priority.MAINTENANCE.value)
+        sched = await queue.submit("sched", TaskType.BACKGROUND, priority=Priority.SCHEDULED.value)
+        user = await queue.submit("user", TaskType.BACKGROUND, priority=Priority.USER.value)
+        interactive = await queue.submit("interactive", TaskType.IMMEDIATE, priority=Priority.INTERACTIVE.value)
+        immediate = await queue.submit("immediate", TaskType.IMMEDIATE, priority=Priority.IMMEDIATE.value)
+
+        # Expected dequeue order: interactive, immediate (ties broken by FIFO seq/timestamp), user, sched, bg, maint
+        t1 = await queue.get_pending()
+        t2 = await queue.get_pending()
+        t3 = await queue.get_pending()
+        t4 = await queue.get_pending()
+        t5 = await queue.get_pending()
+        t6 = await queue.get_pending()
+
+        assert t1.task_id == interactive.task_id
+        assert t2.task_id == immediate.task_id
+        assert t3.task_id == user.task_id
+        assert t4.task_id == sched.task_id
+        assert t5.task_id == bg.task_id
+        assert t6.task_id == maint.task_id
+
 
 class TestProviderSemaphoreLimits:
 

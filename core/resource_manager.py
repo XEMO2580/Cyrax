@@ -29,10 +29,11 @@ _FALLBACK_PROVIDER_LIMIT: int = 1  # for any provider not explicitly listed
 class Priority(IntEnum):
     """
     Lower value = higher priority. Used directly as the sort key in
-    TaskQueue's PriorityQueue — IMMEDIATE (0) dequeues before
+    TaskQueue's PriorityQueue — INTERACTIVE / IMMEDIATE (0) dequeues before
     BACKGROUND (3) without any extra translation.
     """
     INTERACTIVE = 0
+    IMMEDIATE   = 0
     USER        = 1
     SCHEDULED   = 2
     BACKGROUND  = 3

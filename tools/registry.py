@@ -213,6 +213,14 @@ class ToolRegistry:
         """Returns a sorted list of all registered tool names."""
         return sorted(self._tools.keys())
 
+    def get_tool_schema(self, tool_name: str) -> Type[BaseModel] | None:
+        """
+        Returns the Pydantic args_schema for the named tool without exposing
+        the executable tool instance.
+        """
+        tool = self._tools.get(tool_name)
+        return tool.args_schema if tool is not None else None
+
     # ── Execution ─────────────────────────────────────────────────────────────
 
     async def execute_tool(

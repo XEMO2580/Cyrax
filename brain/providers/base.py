@@ -68,6 +68,15 @@ class ProviderError(Exception):
         )
 
 
+class ProviderCapabilityError(ProviderError):
+    """
+    Raised when no provider can satisfy the requested capability matrix 
+    (e.g. requires STRUCTURED_JSON and STREAMING, but no available provider supports both).
+    """
+    def __init__(self, message: str, provider: str = "router") -> None:
+        super().__init__(message, provider=provider, status_code=400, retryable=False)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PROVIDER CAPABILITY FLAGS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -77,9 +86,21 @@ from enum import Enum
 
 class GenerationMode(str, Enum):
     TEXT = "text"
-    STREAMING_TEXT = "streaming_text"
     STRUCTURED_JSON = "structured_json"
-    STREAMING_STRUCTURED_JSON = "streaming_structured_json"
+
+
+class StreamLifecycleState(str, Enum):
+    """
+    Explicit lifecycle states for streaming generation across all providers.
+    """
+    STARTED = "started"
+    CHUNK_RECEIVED = "chunk_received"
+    PARTIAL = "partial"
+    COMPLETED = "completed"
+    EMPTY = "empty"
+    CANCELLED = "cancelled"
+    TIMEOUT = "timeout"
+    FAILED = "failed"
 
 
 class ProviderCapabilities:
@@ -94,9 +115,8 @@ class ProviderCapabilities:
         max_output_tokens:      Hard ceiling on tokens the provider will generate.
         context_window_tokens:  Maximum tokens the provider accepts as input.
         text:                   Supports plain text generation.
-        streaming_text:         Supports streaming plain text generation.
-        structured_json:        Supports structured JSON generation (server-side validated when available).
-        streaming_structured_json: Supports streaming structured JSON.
+        streaming:              Supports streaming generation.
+        structured_json:        Supports structured JSON generation.
         cancellation:           Supports generation cancellation via CancellationToken.
     """
 
@@ -108,9 +128,8 @@ class ProviderCapabilities:
         max_output_tokens:      int  = 1024,
         context_window_tokens:  int  = 8192,
         text:                   bool = True,
-        streaming_text:         bool = False,
+        streaming:              bool = False,
         structured_json:        bool = False,
-        streaming_structured_json: bool = False,
         cancellation:           bool = False,
     ) -> None:
         self.supports_json_mode     = supports_json_mode
@@ -119,9 +138,8 @@ class ProviderCapabilities:
         self.max_output_tokens      = max_output_tokens
         self.context_window_tokens  = context_window_tokens
         self.text                   = text
-        self.streaming_text         = streaming_text
+        self.streaming              = streaming
         self.structured_json        = structured_json
-        self.streaming_structured_json = streaming_structured_json
         self.cancellation           = cancellation
 
 
